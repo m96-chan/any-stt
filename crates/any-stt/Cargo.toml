@@ -1,0 +1,14 @@
+[package]
+name = "any-stt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = "2"
+
+[features]
+cuda = []
+metal = []
+coreml = []
+vulkan = []
+nnapi = []
