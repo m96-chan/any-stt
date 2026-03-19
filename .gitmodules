@@ -1,0 +1,3 @@
+[submodule "third-party/whisper.cpp"]
+	path = third-party/whisper.cpp
+	url = https://github.com/m96-chan/whisper.cpp.git
