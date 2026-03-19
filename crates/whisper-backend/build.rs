@@ -43,8 +43,8 @@ fn main() {
             let toolchain = format!("{ndk}/build/cmake/android.toolchain.cmake");
             cfg.define("CMAKE_TOOLCHAIN_FILE", &toolchain)
                 .define("ANDROID_ABI", "arm64-v8a")
-                .define("ANDROID_PLATFORM", "android-28")
-                .define("ANDROID_STL", "c++_static");
+                .define("ANDROID_PLATFORM", "android-24")
+                .define("ANDROID_STL", "c++_shared");
         }
     }
 
