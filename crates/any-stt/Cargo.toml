@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 thiserror = "2"
 
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"
+
 [features]
 cuda = []
 metal = []

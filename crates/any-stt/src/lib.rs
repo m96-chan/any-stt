@@ -1,10 +1,13 @@
 pub mod config;
+pub mod detect;
 pub mod error;
 pub mod hardware;
+pub mod selector;
 
 pub use config::{Backend, Model, Quantization, SttConfig};
 pub use error::SttError;
 pub use hardware::HardwareInfo;
+pub use selector::Selection;
 
 /// Result of a transcription.
 #[derive(Debug, Clone)]
@@ -41,31 +44,7 @@ pub fn initialize(_config: SttConfig) -> Result<Box<dyn SttEngine>, SttError> {
 
 /// Detect hardware capabilities without loading a model.
 pub fn detect_hardware() -> HardwareInfo {
-    // Stub: returns empty/default info until real detection is implemented.
-    HardwareInfo {
-        cpu: hardware::CpuInfo {
-            arch: std::env::consts::ARCH.into(),
-            features: Vec::new(),
-            cores: 0,
-        },
-        gpu: None,
-        npu: None,
-        os: hardware::OsInfo {
-            platform: if cfg!(target_os = "macos") {
-                hardware::Platform::MacOs
-            } else if cfg!(target_os = "linux") {
-                hardware::Platform::Linux
-            } else if cfg!(target_os = "android") {
-                hardware::Platform::Android
-            } else if cfg!(target_os = "ios") {
-                hardware::Platform::Ios
-            } else {
-                hardware::Platform::Linux // fallback
-            },
-            version: String::new(),
-        },
-        available_ram_mb: 0,
-    }
+    detect::detect_hardware()
 }
 
 #[cfg(test)]
@@ -95,11 +74,10 @@ mod tests {
     }
 
     #[test]
-    fn detect_hardware_returns_stub() {
+    fn detect_hardware_returns_valid_info() {
         let hw = detect_hardware();
         assert!(!hw.cpu.arch.is_empty());
-        assert!(hw.gpu.is_none());
-        assert!(hw.npu.is_none());
+        assert!(hw.cpu.cores > 0);
     }
 
     #[test]
