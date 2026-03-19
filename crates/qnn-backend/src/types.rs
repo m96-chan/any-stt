@@ -281,6 +281,40 @@ pub struct Qnn_OpConfig_t {
     pub v1: Qnn_OpConfigV1_t,
 }
 
+impl Qnn_OpConfig_t {
+    pub fn new(
+        name: *const c_char,
+        package_name: *const c_char,
+        type_name: *const c_char,
+        params: &mut [Qnn_Param_t],
+        inputs: &mut [Qnn_Tensor_t],
+        outputs: &mut [Qnn_Tensor_t],
+    ) -> Self {
+        Self {
+            version: QNN_OPCONFIG_VERSION_1,
+            _pad: 0,
+            v1: Qnn_OpConfigV1_t {
+                name,
+                package_name,
+                type_name,
+                num_of_params: params.len() as u32,
+                _pad0: 0,
+                params: if params.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    params.as_mut_ptr()
+                },
+                num_of_inputs: inputs.len() as u32,
+                _pad1: 0,
+                input_tensors: inputs.as_mut_ptr(),
+                num_of_outputs: outputs.len() as u32,
+                _pad2: 0,
+                output_tensors: outputs.as_mut_ptr(),
+            },
+        }
+    }
+}
+
 // ======================================================================
 // Version types
 // ======================================================================

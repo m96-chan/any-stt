@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::ptr;
 
-use super::types::*;
+use crate::types::*;
 
 /// A loaded QNN backend with resolved interface vtable.
 pub struct QnnLibrary {

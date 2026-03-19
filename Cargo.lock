@@ -85,6 +85,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "qnn-backend"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -188,6 +195,7 @@ dependencies = [
  "cmake",
  "hound",
  "libloading",
+ "qnn-backend",
  "serde",
  "serde_json",
 ]

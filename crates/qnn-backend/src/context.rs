@@ -3,8 +3,8 @@
 use std::ffi::CString;
 use std::ptr;
 
-use super::loader::QnnLibrary;
-use super::types::*;
+use crate::loader::QnnLibrary;
+use crate::types::*;
 
 /// A live QNN execution context.
 pub struct QnnContext {

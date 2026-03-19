@@ -3,7 +3,7 @@
 //! This test is skipped if QNN libraries are not available.
 //! Set QNN_LIB_DIR to the directory containing libQnnHtp.so.
 
-use whisper_backend::qnn::{is_qnn_available, QnnContext, QnnLibrary};
+use qnn_backend::{is_qnn_available, QnnContext, QnnLibrary};
 
 #[test]
 fn qnn_availability_check() {
