@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 any-stt = { path = "../any-stt" }
+libloading = "0.8"
 
 [dev-dependencies]
 hound = "3"

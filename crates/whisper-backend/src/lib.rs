@@ -1,4 +1,5 @@
 pub mod ffi;
+pub mod qnn;
 
 use std::ffi::{CStr, CString};
 use std::path::Path;
