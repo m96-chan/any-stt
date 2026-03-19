@@ -8,16 +8,16 @@ fn main() {
         .canonicalize()
         .expect("third-party/whisper.cpp not found — did you init the submodule?");
 
-    // --- Step 1: Build whisper.cpp via cmake ---
-
-    let mut cfg = cmake::Config::new(&whisper_dir);
-
     let target = env::var("TARGET").unwrap_or_default();
     let is_android = target.contains("android");
     let is_cross = env::var("HOST").unwrap_or_default() != target;
 
-    // Build shared library on Android (static init in .so avoids linker issues),
-    // static library on other platforms.
+    // --- Step 1: Build whisper.cpp via cmake ---
+
+    let mut cfg = cmake::Config::new(&whisper_dir);
+
+    // Android: shared libs (loaded via dlopen to avoid static libc crash).
+    // Others: static libs (linked directly).
     cfg.define("BUILD_SHARED_LIBS", if is_android { "ON" } else { "OFF" })
         .define("WHISPER_BUILD_TESTS", "OFF")
         .define("WHISPER_BUILD_EXAMPLES", "OFF")
@@ -26,9 +26,7 @@ fn main() {
         .define("WHISPER_OPENVINO", "OFF")
         .define("WHISPER_CURL", "OFF")
         .define("WHISPER_SDL2", "OFF")
-        // GGML_NATIVE uses -mcpu=native which breaks cross-compilation.
         .define("GGML_NATIVE", if is_cross { "OFF" } else { "ON" })
-        // Disable all GPU backends for the base CPU build.
         .define("GGML_CUDA", "OFF")
         .define("GGML_METAL", "OFF")
         .define("GGML_VULKAN", "OFF")
@@ -36,10 +34,8 @@ fn main() {
         .define("GGML_SYCL", "OFF")
         .define("GGML_RPC", "OFF");
 
-    // Android: use NDK cmake toolchain and disable OpenMP.
     if is_android {
         cfg.define("GGML_OPENMP", "OFF");
-
         if let Ok(ndk) = env::var("ANDROID_NDK_HOME") {
             let toolchain = format!("{ndk}/build/cmake/android.toolchain.cmake");
             cfg.define("CMAKE_TOOLCHAIN_FILE", &toolchain)
@@ -51,70 +47,96 @@ fn main() {
 
     let dst = cfg.build();
 
-    // Link search paths — cmake installs libs into lib/ or lib64/.
     let lib_dir = dst.join("lib");
     let lib64_dir = dst.join("lib64");
-    if lib_dir.exists() {
-        println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    }
-    if lib64_dir.exists() {
-        println!("cargo:rustc-link-search=native={}", lib64_dir.display());
-    }
-
-    // --- Step 2: Build our C shim ---
-
-    let include_dir = dst.join("include");
-    cc::Build::new()
-        .file(manifest_dir.join("csrc/shim.c"))
-        .include(&include_dir)
-        .include(whisper_dir.join("include"))
-        .include(whisper_dir.join("ggml/include"))
-        .warnings(false)
-        .compile("whisper_shim");
-
-    // --- Step 3: Link ---
 
     if is_android {
-        // Android: link whisper as shared library.
-        // TODO: whisper.so's static init triggers getauxval crash on Android 15
-        // due to NDK's static libc. Need to dlopen whisper.so at runtime instead.
-        println!("cargo:rustc-link-lib=dylib=whisper");
-        println!("cargo:rustc-link-lib=dylib=ggml");
-        println!("cargo:rustc-link-lib=dylib=ggml-base");
-        println!("cargo:rustc-link-lib=dylib=ggml-cpu");
-        println!("cargo:rustc-link-lib=c++_shared");
+        // ============================================================
+        // Android: dlopen-based loading.
+        //
+        // We do NOT link whisper/ggml/shim at all. The .so files are
+        // built by cmake and deployed alongside the binary. At runtime,
+        // WhisperEngine uses libloading to dlopen them.
+        //
+        // This avoids the NDK static libc getauxval crash on Android 15.
+        // ============================================================
+
+        // Build the shim as a shared library too.
+        if let Ok(ndk) = env::var("ANDROID_NDK_HOME") {
+            let ndk_bin =
+                format!("{ndk}/toolchains/llvm/prebuilt/linux-x86_64/bin");
+            let cc = format!("{ndk_bin}/aarch64-linux-android35-clang");
+
+            let include_dir = dst.join("include");
+            let shim_src = manifest_dir.join("csrc/shim.c");
+            let shim_out = lib_dir.join("libwhisper_shim.so");
+
+            let status = std::process::Command::new(&cc)
+                .args([
+                    "-shared", "-fPIC", "-o",
+                    shim_out.to_str().unwrap(),
+                    shim_src.to_str().unwrap(),
+                    &format!("-I{}", include_dir.display()),
+                    &format!("-I{}", whisper_dir.join("include").display()),
+                    &format!("-I{}", whisper_dir.join("ggml/include").display()),
+                    &format!("-L{}", lib_dir.display()),
+                    "-lwhisper",
+                    &format!("-Wl,-rpath,$ORIGIN"),
+                ])
+                .status()
+                .expect("failed to compile shim.so");
+            assert!(status.success(), "shim.so compilation failed");
+        }
+
+        // Tell cargo where the .so files are (for the build to find them,
+        // even though we don't link them).
+        if lib_dir.exists() {
+            println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        }
+
+        // Output the lib dir path as a cargo env var so tests can find the .so files.
+        println!(
+            "cargo:rustc-env=WHISPER_LIB_DIR={}",
+            lib_dir.display()
+        );
     } else {
-        // Other platforms: static link for simplicity.
+        // ============================================================
+        // Non-Android: static linking (original approach).
+        // ============================================================
+
+        if lib_dir.exists() {
+            println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        }
+        if lib64_dir.exists() {
+            println!("cargo:rustc-link-search=native={}", lib64_dir.display());
+        }
+
+        // Build shim as static lib.
+        let include_dir = dst.join("include");
+        cc::Build::new()
+            .file(manifest_dir.join("csrc/shim.c"))
+            .include(&include_dir)
+            .include(whisper_dir.join("include"))
+            .include(whisper_dir.join("ggml/include"))
+            .warnings(false)
+            .compile("whisper_shim");
+
         println!("cargo:rustc-link-lib=static=whisper");
         println!("cargo:rustc-link-lib=static=ggml");
         println!("cargo:rustc-link-lib=static=ggml-base");
         println!("cargo:rustc-link-lib=static=ggml-cpu");
-    }
 
-    // System dependencies.
-    if is_android {
-        // Add NDK sysroot lib path for C++ standard library.
-        if let Ok(ndk) = env::var("ANDROID_NDK_HOME") {
-            let ndk_lib = format!(
-                "{ndk}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android"
-            );
-            println!("cargo:rustc-link-search=native={ndk_lib}");
-        }
-        // Don't link c++ at all from Rust side — whisper.so already links it.
-        // Android bionic has pthreads built-in; no -lpthread needed.
-    } else {
         println!("cargo:rustc-link-lib=stdc++");
         println!("cargo:rustc-link-lib=gomp");
         println!("cargo:rustc-link-lib=pthread");
+
+        #[cfg(target_os = "macos")]
+        {
+            println!("cargo:rustc-link-lib=framework=Accelerate");
+            println!("cargo:rustc-link-lib=c++");
+        }
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        println!("cargo:rustc-link-lib=framework=Accelerate");
-        println!("cargo:rustc-link-lib=c++");
-    }
-
-    // Re-run if source changes.
     println!("cargo:rerun-if-changed={}", whisper_dir.display());
     println!("cargo:rerun-if-changed=csrc/shim.c");
 }

@@ -1,6 +1,9 @@
 pub mod ffi;
 pub mod qnn;
 
+#[cfg(target_os = "android")]
+pub mod dlopen_ffi;
+
 use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::time::Instant;
