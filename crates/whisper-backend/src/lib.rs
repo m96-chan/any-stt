@@ -173,6 +173,29 @@ impl SttEngine for WhisperEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap()
+    }
+
+    fn model_path() -> PathBuf {
+        repo_root().join("third-party/whisper.cpp/models/ggml-tiny.en.bin")
+    }
+
+    /// Helper: skip test if model not downloaded.
+    fn require_model() -> PathBuf {
+        let p = model_path();
+        if !p.exists() {
+            eprintln!("SKIPPED: model not found at {}", p.display());
+        }
+        p
+    }
+
+    // ---- Constructor tests ----
 
     #[test]
     fn load_nonexistent_model_returns_error() {
@@ -184,5 +207,168 @@ mod tests {
             hw,
         );
         assert!(result.is_err());
+        match result {
+            Err(SttError::ModelNotFound { .. }) => {}
+            Err(other) => panic!("expected ModelNotFound, got: {other}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn load_directory_as_model_returns_error() {
+        let hw = any_stt::detect_hardware();
+        let result = WhisperEngine::new(Path::new("/tmp"), "en", Backend::Cpu, hw);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_valid_model_succeeds() {
+        let model = require_model();
+        if !model.exists() {
+            return;
+        }
+        let hw = any_stt::detect_hardware();
+        let engine = WhisperEngine::new(&model, "en", Backend::Cpu, hw);
+        assert!(engine.is_ok());
+    }
+
+    // ---- SttEngine trait method tests ----
+
+    #[test]
+    fn is_ready_after_load() {
+        let model = require_model();
+        if !model.exists() {
+            return;
+        }
+        let hw = any_stt::detect_hardware();
+        let engine = WhisperEngine::new(&model, "en", Backend::Cpu, hw).unwrap();
+        assert!(engine.is_ready());
+    }
+
+    #[test]
+    fn active_backend_matches_constructor_arg() {
+        let model = require_model();
+        if !model.exists() {
+            return;
+        }
+        let hw = any_stt::detect_hardware();
+        let engine = WhisperEngine::new(&model, "en", Backend::Cpu, hw).unwrap();
+        assert_eq!(engine.active_backend(), Backend::Cpu);
+    }
+
+    #[test]
+    fn hardware_info_is_accessible() {
+        let model = require_model();
+        if !model.exists() {
+            return;
+        }
+        let hw = any_stt::detect_hardware();
+        let engine = WhisperEngine::new(&model, "en", Backend::Cpu, hw).unwrap();
+        let info = engine.hardware_info();
+        assert!(!info.cpu.arch.is_empty());
+        assert!(info.cpu.cores > 0);
+    }
+
+    #[test]
+    fn transcribe_empty_audio_returns_empty_text() {
+        let model = require_model();
+        if !model.exists() {
+            return;
+        }
+        let hw = any_stt::detect_hardware();
+        let engine = WhisperEngine::new(&model, "en", Backend::Cpu, hw).unwrap();
+        // 1 second of silence at 16kHz.
+        let silence = vec![0.0f32; 16000];
+        let result = engine.transcribe(&silence).unwrap();
+        // Silence should produce empty or whitespace-only text.
+        assert!(
+            result.text.trim().is_empty() || result.text.trim().starts_with('['),
+            "expected empty/blank output for silence, got: {:?}",
+            result.text
+        );
+        assert_eq!(result.backend_used, Backend::Cpu);
+        assert!(result.duration_ms > 0.0);
+    }
+
+    #[test]
+    fn transcribe_returns_valid_language() {
+        let model = require_model();
+        if !model.exists() {
+            return;
+        }
+        let hw = any_stt::detect_hardware();
+        let engine = WhisperEngine::new(&model, "en", Backend::Cpu, hw).unwrap();
+        let silence = vec![0.0f32; 16000];
+        let result = engine.transcribe(&silence).unwrap();
+        assert_eq!(result.language, "en");
+    }
+
+    // ---- FFI shim tests ----
+
+    #[test]
+    fn shim_default_params_allocates_and_frees() {
+        let params = unsafe { shim_default_params(WhisperSamplingStrategy::Greedy) };
+        assert!(!params.is_null());
+        unsafe { shim_free_params(params) };
+    }
+
+    #[test]
+    fn shim_default_params_beam_search() {
+        let params = unsafe { shim_default_params(WhisperSamplingStrategy::BeamSearch) };
+        assert!(!params.is_null());
+        unsafe { shim_free_params(params) };
+    }
+
+    #[test]
+    fn shim_param_setters_dont_crash() {
+        let params = unsafe { shim_default_params(WhisperSamplingStrategy::Greedy) };
+        assert!(!params.is_null());
+        let lang = CString::new("ja").unwrap();
+        unsafe {
+            shim_params_set_language(params, lang.as_ptr());
+            shim_params_set_n_threads(params, 4);
+            shim_params_set_translate(params, true);
+            shim_params_set_no_timestamps(params, true);
+            shim_params_set_single_segment(params, true);
+            shim_params_set_print_special(params, false);
+            shim_params_set_print_progress(params, false);
+            shim_params_set_print_realtime(params, false);
+            shim_params_set_print_timestamps(params, false);
+            shim_params_set_suppress_nst(params, true);
+            shim_free_params(params);
+        }
+    }
+
+    #[test]
+    fn whisper_context_default_params_returns_valid() {
+        let params = unsafe { whisper_context_default_params() };
+        // GPU should be enabled by default in whisper.cpp.
+        assert!(params.use_gpu);
+    }
+
+    #[test]
+    fn whisper_lang_id_roundtrip() {
+        let lang = CString::new("en").unwrap();
+        let id = unsafe { whisper_lang_id(lang.as_ptr()) };
+        assert!(id >= 0, "expected valid lang id for 'en'");
+        let str_ptr = unsafe { whisper_lang_str(id) };
+        assert!(!str_ptr.is_null());
+        let s = unsafe { CStr::from_ptr(str_ptr) }.to_str().unwrap();
+        assert_eq!(s, "en");
+    }
+
+    #[test]
+    fn whisper_lang_id_unknown_returns_negative() {
+        let lang = CString::new("zzznotareal").unwrap();
+        let id = unsafe { whisper_lang_id(lang.as_ptr()) };
+        assert!(id < 0, "expected negative for unknown language");
+    }
+
+    #[test]
+    fn whisper_print_system_info_returns_nonnull() {
+        let info = unsafe { whisper_print_system_info() };
+        assert!(!info.is_null());
+        let s = unsafe { CStr::from_ptr(info) }.to_str().unwrap();
+        assert!(!s.is_empty());
     }
 }
