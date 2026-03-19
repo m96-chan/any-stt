@@ -1,0 +1,79 @@
+use std::env;
+use std::path::PathBuf;
+
+fn main() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let whisper_dir = manifest_dir
+        .join("../../third-party/whisper.cpp")
+        .canonicalize()
+        .expect("third-party/whisper.cpp not found — did you init the submodule?");
+
+    // --- Step 1: Build whisper.cpp via cmake ---
+
+    let mut cfg = cmake::Config::new(&whisper_dir);
+
+    // Build static library, CPU-only, no examples/tests.
+    cfg.define("BUILD_SHARED_LIBS", "OFF")
+        .define("WHISPER_BUILD_TESTS", "OFF")
+        .define("WHISPER_BUILD_EXAMPLES", "OFF")
+        .define("WHISPER_BUILD_SERVER", "OFF")
+        .define("WHISPER_COREML", "OFF")
+        .define("WHISPER_OPENVINO", "OFF")
+        .define("WHISPER_CURL", "OFF")
+        .define("WHISPER_SDL2", "OFF")
+        .define("GGML_NATIVE", "ON")
+        // Disable all GPU backends for the base CPU build.
+        .define("GGML_CUDA", "OFF")
+        .define("GGML_METAL", "OFF")
+        .define("GGML_VULKAN", "OFF")
+        .define("GGML_OPENCL", "OFF")
+        .define("GGML_SYCL", "OFF")
+        .define("GGML_RPC", "OFF");
+
+    let dst = cfg.build();
+
+    // Link search paths — cmake installs libs into lib/ or lib64/.
+    let lib_dir = dst.join("lib");
+    let lib64_dir = dst.join("lib64");
+    if lib_dir.exists() {
+        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    }
+    if lib64_dir.exists() {
+        println!("cargo:rustc-link-search=native={}", lib64_dir.display());
+    }
+
+    // --- Step 2: Build our C shim ---
+
+    let include_dir = dst.join("include");
+    cc::Build::new()
+        .file(manifest_dir.join("csrc/shim.c"))
+        .include(&include_dir)
+        .include(whisper_dir.join("include"))
+        .include(whisper_dir.join("ggml/include"))
+        .warnings(false)
+        .compile("whisper_shim");
+
+    // --- Step 3: Link ---
+
+    // Link the static libraries produced by the cmake build.
+    // Order matters: whisper depends on ggml libs.
+    println!("cargo:rustc-link-lib=static=whisper");
+    println!("cargo:rustc-link-lib=static=ggml");
+    println!("cargo:rustc-link-lib=static=ggml-base");
+    println!("cargo:rustc-link-lib=static=ggml-cpu");
+
+    // System dependencies.
+    println!("cargo:rustc-link-lib=stdc++");
+    println!("cargo:rustc-link-lib=pthread");
+    println!("cargo:rustc-link-lib=gomp");
+
+    #[cfg(target_os = "macos")]
+    {
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+        println!("cargo:rustc-link-lib=c++");
+    }
+
+    // Re-run if source changes.
+    println!("cargo:rerun-if-changed={}", whisper_dir.display());
+    println!("cargo:rerun-if-changed=csrc/shim.c");
+}

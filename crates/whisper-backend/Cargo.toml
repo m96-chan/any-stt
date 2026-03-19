@@ -1,0 +1,14 @@
+[package]
+name = "whisper-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+any-stt = { path = "../any-stt" }
+
+[dev-dependencies]
+hound = "3"
+
+[build-dependencies]
+cmake = "0.1"
+cc = "1"
