@@ -3,7 +3,7 @@ use crate::hardware::{CpuFeature, CpuInfo, HardwareInfo, NpuInfo, OsInfo, Platfo
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use crate::hardware::{GpuInfo, GpuVendor, NpuType};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::hardware::{GpuInfo, GpuVendor};
 
 #[cfg(target_os = "android")]

@@ -12,6 +12,10 @@ fn main() {
 
     let mut cfg = cmake::Config::new(&whisper_dir);
 
+    let target = env::var("TARGET").unwrap_or_default();
+    let is_android = target.contains("android");
+    let is_cross = env::var("HOST").unwrap_or_default() != target;
+
     // Build static library, CPU-only, no examples/tests.
     cfg.define("BUILD_SHARED_LIBS", "OFF")
         .define("WHISPER_BUILD_TESTS", "OFF")
@@ -21,7 +25,8 @@ fn main() {
         .define("WHISPER_OPENVINO", "OFF")
         .define("WHISPER_CURL", "OFF")
         .define("WHISPER_SDL2", "OFF")
-        .define("GGML_NATIVE", "ON")
+        // GGML_NATIVE uses -mcpu=native which breaks cross-compilation.
+        .define("GGML_NATIVE", if is_cross { "OFF" } else { "ON" })
         // Disable all GPU backends for the base CPU build.
         .define("GGML_CUDA", "OFF")
         .define("GGML_METAL", "OFF")
@@ -29,6 +34,19 @@ fn main() {
         .define("GGML_OPENCL", "OFF")
         .define("GGML_SYCL", "OFF")
         .define("GGML_RPC", "OFF");
+
+    // Android: use NDK cmake toolchain and disable OpenMP.
+    if is_android {
+        cfg.define("GGML_OPENMP", "OFF");
+
+        if let Ok(ndk) = env::var("ANDROID_NDK_HOME") {
+            let toolchain = format!("{ndk}/build/cmake/android.toolchain.cmake");
+            cfg.define("CMAKE_TOOLCHAIN_FILE", &toolchain)
+                .define("ANDROID_ABI", "arm64-v8a")
+                .define("ANDROID_PLATFORM", "android-28")
+                .define("ANDROID_STL", "c++_static");
+        }
+    }
 
     let dst = cfg.build();
 
@@ -63,9 +81,21 @@ fn main() {
     println!("cargo:rustc-link-lib=static=ggml-cpu");
 
     // System dependencies.
-    println!("cargo:rustc-link-lib=stdc++");
-    println!("cargo:rustc-link-lib=pthread");
-    println!("cargo:rustc-link-lib=gomp");
+    if is_android {
+        // Add NDK sysroot lib path for C++ standard library.
+        if let Ok(ndk) = env::var("ANDROID_NDK_HOME") {
+            let ndk_lib = format!(
+                "{ndk}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android"
+            );
+            println!("cargo:rustc-link-search=native={ndk_lib}");
+        }
+        println!("cargo:rustc-link-lib=c++_shared");
+        // Android bionic has pthreads built-in; no -lpthread needed.
+    } else {
+        println!("cargo:rustc-link-lib=stdc++");
+        println!("cargo:rustc-link-lib=gomp");
+        println!("cargo:rustc-link-lib=pthread");
+    }
 
     #[cfg(target_os = "macos")]
     {
