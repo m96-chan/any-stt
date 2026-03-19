@@ -16,8 +16,9 @@ fn main() {
     let is_android = target.contains("android");
     let is_cross = env::var("HOST").unwrap_or_default() != target;
 
-    // Build static library, CPU-only, no examples/tests.
-    cfg.define("BUILD_SHARED_LIBS", "OFF")
+    // Build shared library on Android (static init in .so avoids linker issues),
+    // static library on other platforms.
+    cfg.define("BUILD_SHARED_LIBS", if is_android { "ON" } else { "OFF" })
         .define("WHISPER_BUILD_TESTS", "OFF")
         .define("WHISPER_BUILD_EXAMPLES", "OFF")
         .define("WHISPER_BUILD_SERVER", "OFF")
@@ -73,12 +74,20 @@ fn main() {
 
     // --- Step 3: Link ---
 
-    // Link the static libraries produced by the cmake build.
-    // Order matters: whisper depends on ggml libs.
-    println!("cargo:rustc-link-lib=static=whisper");
-    println!("cargo:rustc-link-lib=static=ggml");
-    println!("cargo:rustc-link-lib=static=ggml-base");
-    println!("cargo:rustc-link-lib=static=ggml-cpu");
+    if is_android {
+        // Android: link whisper as shared library to avoid static init issues.
+        // The .so files need to be pushed alongside the binary.
+        println!("cargo:rustc-link-lib=dylib=whisper");
+        println!("cargo:rustc-link-lib=dylib=ggml");
+        println!("cargo:rustc-link-lib=dylib=ggml-base");
+        println!("cargo:rustc-link-lib=dylib=ggml-cpu");
+    } else {
+        // Other platforms: static link for simplicity.
+        println!("cargo:rustc-link-lib=static=whisper");
+        println!("cargo:rustc-link-lib=static=ggml");
+        println!("cargo:rustc-link-lib=static=ggml-base");
+        println!("cargo:rustc-link-lib=static=ggml-cpu");
+    }
 
     // System dependencies.
     if is_android {

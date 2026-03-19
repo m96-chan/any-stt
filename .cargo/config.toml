@@ -1,9 +1,9 @@
 [target.aarch64-linux-android]
-ar = "/home/m96-chan/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-linker = "/home/m96-chan/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+ar = "/home/m96-chan/Android/Sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+linker = "/home/m96-chan/Android/Sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
 
 [target.aarch64-linux-android.env]
-CC_aarch64-linux-android = "/home/m96-chan/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
-CXX_aarch64-linux-android = "/home/m96-chan/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
-AR_aarch64-linux-android = "/home/m96-chan/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-ANDROID_NDK_HOME = "/home/m96-chan/Android/Sdk/ndk/29.0.14206865"
+CC_aarch64-linux-android = "/home/m96-chan/Android/Sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+CXX_aarch64-linux-android = "/home/m96-chan/Android/Sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+AR_aarch64-linux-android = "/home/m96-chan/Android/Sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+ANDROID_NDK_HOME = "/home/m96-chan/Android/Sdk/ndk/26.3.11579264"
