@@ -78,6 +78,37 @@ extern "C" {
     pub fn whisper_lang_str(id: c_int) -> *const c_char;
     pub fn whisper_lang_id(lang: *const c_char) -> c_int;
 
+    // --- Segment detail accessors ---
+
+    pub fn whisper_full_get_segment_t0(ctx: *mut WhisperContext, i_segment: c_int) -> i64;
+    pub fn whisper_full_get_segment_t1(ctx: *mut WhisperContext, i_segment: c_int) -> i64;
+    pub fn whisper_full_n_tokens(ctx: *mut WhisperContext, i_segment: c_int) -> c_int;
+    pub fn whisper_full_get_token_id(
+        ctx: *mut WhisperContext,
+        i_segment: c_int,
+        i_token: c_int,
+    ) -> c_int;
+    pub fn whisper_full_get_token_p(
+        ctx: *mut WhisperContext,
+        i_segment: c_int,
+        i_token: c_int,
+    ) -> c_float;
+
+    // --- Model info ---
+
+    pub fn whisper_model_n_vocab(ctx: *mut WhisperContext) -> c_int;
+    pub fn whisper_model_n_audio_ctx(ctx: *mut WhisperContext) -> c_int;
+    pub fn whisper_model_n_audio_state(ctx: *mut WhisperContext) -> c_int;
+    pub fn whisper_model_n_audio_head(ctx: *mut WhisperContext) -> c_int;
+    pub fn whisper_model_n_audio_layer(ctx: *mut WhisperContext) -> c_int;
+    pub fn whisper_model_n_text_ctx(ctx: *mut WhisperContext) -> c_int;
+    pub fn whisper_model_n_text_state(ctx: *mut WhisperContext) -> c_int;
+    pub fn whisper_model_n_text_head(ctx: *mut WhisperContext) -> c_int;
+    pub fn whisper_model_n_text_layer(ctx: *mut WhisperContext) -> c_int;
+    pub fn whisper_model_n_mels(ctx: *mut WhisperContext) -> c_int;
+
+    // --- Timings ---
+
     pub fn whisper_print_timings(ctx: *mut WhisperContext);
     pub fn whisper_reset_timings(ctx: *mut WhisperContext);
 
