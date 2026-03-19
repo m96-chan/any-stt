@@ -58,17 +58,26 @@ fn detect_cpu_features() -> Vec<CpuFeature> {
     features
 }
 
-/// Detect SVE on Linux/Android via getauxval(AT_HWCAP).
+/// Detect SVE on Linux/Android via /proc/cpuinfo.
+///
+/// We avoid `getauxval(AT_HWCAP)` because on Android the NDK's static libc
+/// implementation of `getauxval` can crash during early process init
+/// (null deref in `__libc_shared_globals` on Android 15+).
 #[cfg(target_arch = "aarch64")]
 fn detect_sve_linux() -> bool {
-    // AT_HWCAP = 16, HWCAP_SVE bit = (1 << 22) on aarch64 Linux.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        const AT_HWCAP: libc::c_ulong = 16;
-        const HWCAP_SVE: libc::c_ulong = 1 << 22;
-        // SAFETY: getauxval is always safe to call with a valid type.
-        let hwcap = unsafe { libc::getauxval(AT_HWCAP) };
-        return hwcap & HWCAP_SVE != 0;
+        if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
+            // Look for "sve" in the Features line
+            for line in cpuinfo.lines() {
+                if let Some(features) = line.strip_prefix("Features") {
+                    if let Some(features) = features.strip_prefix(|c: char| c == ':' || c == '\t' || c == ' ') {
+                        return features.split_whitespace().any(|f| f == "sve");
+                    }
+                }
+            }
+        }
+        false
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {

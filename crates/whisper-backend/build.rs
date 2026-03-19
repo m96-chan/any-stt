@@ -44,7 +44,7 @@ fn main() {
             let toolchain = format!("{ndk}/build/cmake/android.toolchain.cmake");
             cfg.define("CMAKE_TOOLCHAIN_FILE", &toolchain)
                 .define("ANDROID_ABI", "arm64-v8a")
-                .define("ANDROID_PLATFORM", "android-24")
+                .define("ANDROID_PLATFORM", "android-35")
                 .define("ANDROID_STL", "c++_shared");
         }
     }
@@ -75,12 +75,14 @@ fn main() {
     // --- Step 3: Link ---
 
     if is_android {
-        // Android: link whisper as shared library to avoid static init issues.
-        // The .so files need to be pushed alongside the binary.
+        // Android: link whisper as shared library.
+        // TODO: whisper.so's static init triggers getauxval crash on Android 15
+        // due to NDK's static libc. Need to dlopen whisper.so at runtime instead.
         println!("cargo:rustc-link-lib=dylib=whisper");
         println!("cargo:rustc-link-lib=dylib=ggml");
         println!("cargo:rustc-link-lib=dylib=ggml-base");
         println!("cargo:rustc-link-lib=dylib=ggml-cpu");
+        println!("cargo:rustc-link-lib=c++_shared");
     } else {
         // Other platforms: static link for simplicity.
         println!("cargo:rustc-link-lib=static=whisper");
@@ -98,7 +100,7 @@ fn main() {
             );
             println!("cargo:rustc-link-search=native={ndk_lib}");
         }
-        println!("cargo:rustc-link-lib=c++_shared");
+        // Don't link c++ at all from Rust side — whisper.so already links it.
         // Android bionic has pthreads built-in; no -lpthread needed.
     } else {
         println!("cargo:rustc-link-lib=stdc++");
