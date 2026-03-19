@@ -1,4 +1,4 @@
-//! QNN context management — backend + context lifecycle.
+//! QNN context management — backend + context + graph lifecycle.
 
 use std::ffi::CString;
 use std::ptr;
@@ -18,7 +18,6 @@ impl QnnContext {
     pub fn new(lib: QnnLibrary) -> Result<Self, String> {
         let vt = lib.vt();
 
-        // Create backend (no logger for now).
         let backend_create = vt.backend_create.ok_or("backend_create null")?;
         let mut backend: Qnn_BackendHandle_t = ptr::null_mut();
         let err = unsafe { backend_create(ptr::null_mut(), ptr::null(), &mut backend) };
@@ -26,13 +25,11 @@ impl QnnContext {
             return Err(format!("backend_create: error {err}"));
         }
 
-        // Create context.
         let context_create = vt.context_create.ok_or("context_create null")?;
         let mut context: Qnn_ContextHandle_t = ptr::null_mut();
         let err =
             unsafe { context_create(backend, ptr::null_mut(), ptr::null(), &mut context) };
         if err != QNN_SUCCESS {
-            // Clean up backend on failure.
             if let Some(f) = vt.backend_free {
                 unsafe { f(backend) };
             }
@@ -46,7 +43,7 @@ impl QnnContext {
         })
     }
 
-    /// Create a named graph in this context.
+    /// Create a named graph.
     pub fn create_graph(&self, name: &str) -> Result<Qnn_GraphHandle_t, String> {
         let graph_create = self.lib.vt().graph_create.ok_or("graph_create null")?;
         let name_c = CString::new(name).map_err(|e| e.to_string())?;
@@ -59,7 +56,39 @@ impl QnnContext {
         Ok(graph)
     }
 
-    /// Finalize (compile) a graph for HTP execution.
+    /// Register a tensor with the graph. Backend assigns `tensor.v1.id`.
+    pub fn register_tensor(
+        &self,
+        graph: Qnn_GraphHandle_t,
+        tensor: &mut Qnn_Tensor_t,
+    ) -> Result<u32, String> {
+        let create_tensor = self
+            .lib
+            .vt()
+            .tensor_create_graph_tensor
+            .ok_or("tensor_create_graph_tensor null")?;
+        let err = unsafe { create_tensor(graph, tensor) };
+        if err != QNN_SUCCESS {
+            return Err(format!("tensorCreateGraphTensor: error {err}"));
+        }
+        Ok(tensor.v1.id)
+    }
+
+    /// Add a node (operation) to a graph.
+    pub fn add_node(
+        &self,
+        graph: Qnn_GraphHandle_t,
+        op: Qnn_OpConfig_t,
+    ) -> Result<(), String> {
+        let graph_add_node = self.lib.vt().graph_add_node.ok_or("graph_add_node null")?;
+        let err = unsafe { graph_add_node(graph, op) };
+        if err != QNN_SUCCESS {
+            return Err(format!("graph_add_node: error {err}"));
+        }
+        Ok(())
+    }
+
+    /// Finalize (compile) a graph.
     pub fn finalize_graph(&self, graph: Qnn_GraphHandle_t) -> Result<(), String> {
         let graph_finalize = self.lib.vt().graph_finalize.ok_or("graph_finalize null")?;
         let err = unsafe { graph_finalize(graph, ptr::null_mut(), ptr::null_mut()) };
@@ -69,48 +98,29 @@ impl QnnContext {
         Ok(())
     }
 
-    /// Get the API version reported by the backend.
-    pub fn api_version(&self) -> Result<Qnn_ApiVersion_t, String> {
-        let get_ver = self
-            .lib
-            .vt()
-            .backend_get_api_version
-            .ok_or("backend_get_api_version null")?;
-        let mut ver = Qnn_ApiVersion_t {
-            core_api_version: Qnn_Version_t {
-                major: 0,
-                minor: 0,
-                patch: 0,
-            },
-            backend_api_version: Qnn_Version_t {
-                major: 0,
-                minor: 0,
-                patch: 0,
-            },
+    /// Execute a finalized graph.
+    pub fn execute(
+        &self,
+        graph: Qnn_GraphHandle_t,
+        inputs: &mut [Qnn_Tensor_t],
+        outputs: &mut [Qnn_Tensor_t],
+    ) -> Result<(), String> {
+        let graph_execute = self.lib.vt().graph_execute.ok_or("graph_execute null")?;
+        let err = unsafe {
+            graph_execute(
+                graph,
+                inputs.as_ptr(),
+                inputs.len() as u32,
+                outputs.as_mut_ptr(),
+                outputs.len() as u32,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
         };
-        let err = unsafe { get_ver(&mut ver) };
         if err != QNN_SUCCESS {
-            return Err(format!("backend_get_api_version: error {err}"));
+            return Err(format!("graph_execute: error {err}"));
         }
-        Ok(ver)
-    }
-
-    /// Get the build ID string from the backend.
-    pub fn build_id(&self) -> Result<String, String> {
-        let get_id = self
-            .lib
-            .vt()
-            .backend_get_build_id
-            .ok_or("backend_get_build_id null")?;
-        let mut id_ptr: *const std::os::raw::c_char = ptr::null();
-        let err = unsafe { get_id(&mut id_ptr) };
-        if err != QNN_SUCCESS || id_ptr.is_null() {
-            return Err(format!("backend_get_build_id: error {err}"));
-        }
-        let s = unsafe { std::ffi::CStr::from_ptr(id_ptr) }
-            .to_string_lossy()
-            .into_owned();
-        Ok(s)
+        Ok(())
     }
 }
 
