@@ -6,27 +6,31 @@ Detects hardware (CPU/GPU/NPU) and OS at runtime, then selects the optimal accel
 ## Benchmark Results
 
 Measured on real devices. All times are median of 5 runs.
+whisper.cpp CLI (beam_size=5) shown as reference baseline.
 
 ### tiny.en (77 MB) — JFK inaugural 11.0s
 
-| Platform | Backend | Median | RTF |
-|----------|---------|--------|-----|
-| Linux (RTX 5090) | CUDA | **23ms** | 0.002 |
-| Linux (RTX 5090) | Vulkan | 23ms | 0.002 |
-| Linux (Ryzen 9950X3D) | CPU AVX-512 | 169ms | 0.015 |
-| Android (SD 8 Gen 3) | NPU INT8 + CPU | **162ms** | 0.015 |
-| Android (SD 8 Gen 3) | CPU NEON 8T | 851ms | 0.077 |
+| Platform | Backend | Median | RTF | vs whisper.cpp CLI |
+|----------|---------|--------|-----|--------------------|
+| whisper.cpp CLI | CPU 16T (reference) | 259ms | 0.024 | 1.0x |
+| Linux (RTX 5090) | **CUDA** | **23ms** | 0.002 | **11x faster** |
+| Linux (RTX 5090) | Vulkan | 23ms | 0.002 | 11x faster |
+| Linux (Ryzen 9950X3D) | CPU AVX-512 | 169ms | 0.015 | 1.5x faster |
+| Android (SD 8 Gen 3) | **NPU INT8 + CPU** | **162ms** | 0.015 | 1.6x faster |
+| Android (SD 8 Gen 3) | CPU NEON 8T | 851ms | 0.077 | 3.3x slower |
 
 ### Large-v2 / Kotoba (3.1 GB) — Japanese 7.4s
 
-| Platform | Backend | Median | RTF |
-|----------|---------|--------|-----|
-| Linux (RTX 5090) | CUDA | **99ms** | 0.013 |
-| Linux (RTX 5090) | Vulkan | 106ms | 0.014 |
-| Linux (Ryzen 9950X3D) | CPU AVX-512 | 6836ms | 0.928 |
-| Android (SD 8 Gen 3) | NPU INT8 + CPU | **5.4s** | **0.73** |
-| Android (SD 8 Gen 3) | CPU NEON 8T | 66.6s | 9.05 |
+| Platform | Backend | Median | RTF | vs whisper.cpp CLI |
+|----------|---------|--------|-----|--------------------|
+| whisper.cpp CLI | CPU 16T (reference) | 7517ms | 1.020 | 1.0x |
+| Linux (RTX 5090) | **CUDA** | **99ms** | 0.013 | **76x faster** |
+| Linux (RTX 5090) | Vulkan | 106ms | 0.014 | 71x faster |
+| Linux (Ryzen 9950X3D) | CPU AVX-512 | 6836ms | 0.928 | 1.1x faster |
+| Android (SD 8 Gen 3) | **NPU INT8 + CPU** | **5.4s** | **0.73** | **1.4x faster** |
+| Android (SD 8 Gen 3) | CPU NEON 8T | 66.6s | 9.05 | 8.9x slower |
 
+> whisper.cpp CLI: `whisper-cli -t 16` (beam_size=5, best_of=5). any-stt: greedy decoding.
 > Output: "我輩は猫である。名前はまだない。どこで生まれたかとんと見当がつかぬ。"
 > Output MATCH verified between CPU and hybrid (NPU+CPU) paths.
 
