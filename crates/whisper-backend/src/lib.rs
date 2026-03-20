@@ -94,6 +94,10 @@ impl Drop for WhisperEngine {
 
 impl SttEngine for WhisperEngine {
     fn transcribe(&self, audio: &[f32]) -> Result<SttResult, SttError> {
+        if audio.is_empty() {
+            return Err(SttError::InvalidAudio("empty audio buffer".into()));
+        }
+
         let start = Instant::now();
 
         // Create params via shim.
@@ -175,6 +179,48 @@ impl SttEngine for WhisperEngine {
     fn active_backend(&self) -> Backend {
         self.backend
     }
+}
+
+/// Initialize the best available STT engine with automatic fallback.
+///
+/// Tries QNN NPU (Snapdragon) → CPU, returning the first working engine.
+/// Never fails due to NPU unavailability — always falls back to CPU.
+///
+/// # Errors
+/// - `SttError::ModelNotFound` if `config.model_path` doesn't exist
+/// - `SttError::TranscriptionFailed` if whisper.cpp fails to load the model
+pub fn initialize(config: &any_stt::SttConfig) -> Result<Box<dyn SttEngine>, SttError> {
+    let model_path = config.model_path.as_ref().ok_or_else(|| {
+        SttError::TranscriptionFailed("model_path is required".into())
+    })?;
+
+    if !model_path.exists() {
+        return Err(SttError::ModelNotFound {
+            path: model_path.clone(),
+        });
+    }
+
+    let hw = any_stt::detect_hardware();
+
+    // Try hybrid engine (auto-detects NPU, falls back to CPU internally)
+    match hybrid::WhisperQnnEngine::new(model_path, &config.language, hw.clone()) {
+        Ok(engine) => {
+            eprintln!("initialize: using {} backend", match engine.active_backend() {
+                Backend::Qnn => "QNN NPU",
+                _ => "CPU",
+            });
+            return Ok(Box::new(engine));
+        }
+        Err(e) => {
+            eprintln!("initialize: hybrid engine failed ({e}), trying CPU-only");
+        }
+    }
+
+    // Fallback: pure CPU whisper.cpp
+    let backend = config.backend.unwrap_or(Backend::Cpu);
+    let engine = WhisperEngine::new(model_path, &config.language, backend, hw)?;
+    eprintln!("initialize: using CPU backend");
+    Ok(Box::new(engine))
 }
 
 #[cfg(test)]
@@ -377,5 +423,45 @@ mod tests {
         assert!(!info.is_null());
         let s = unsafe { CStr::from_ptr(info) }.to_str().unwrap();
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn transcribe_empty_audio_returns_error() {
+        let model = require_model();
+        if !model.exists() { return; }
+        let hw = any_stt::detect_hardware();
+        let engine = WhisperEngine::new(&model, "en", Backend::Cpu, hw).unwrap();
+        let result = engine.transcribe(&[]);
+        assert!(matches!(result, Err(SttError::InvalidAudio(_))));
+    }
+
+    #[test]
+    fn initialize_with_valid_model() {
+        let model = require_model();
+        if !model.exists() { return; }
+        let config = any_stt::SttConfig {
+            model_path: Some(model),
+            ..Default::default()
+        };
+        let engine = initialize(&config);
+        assert!(engine.is_ok());
+        assert!(engine.unwrap().is_ready());
+    }
+
+    #[test]
+    fn initialize_with_missing_model() {
+        let config = any_stt::SttConfig {
+            model_path: Some(PathBuf::from("/nonexistent/model.bin")),
+            ..Default::default()
+        };
+        let result = initialize(&config);
+        assert!(matches!(result, Err(SttError::ModelNotFound { .. })));
+    }
+
+    #[test]
+    fn initialize_without_model_path() {
+        let config = any_stt::SttConfig::default();
+        let result = initialize(&config);
+        assert!(result.is_err());
     }
 }

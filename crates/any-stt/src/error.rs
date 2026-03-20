@@ -14,6 +14,9 @@ pub enum SttError {
     #[error("transcription failed: {0}")]
     TranscriptionFailed(String),
 
+    #[error("invalid audio: {0}")]
+    InvalidAudio(String),
+
     #[error("not implemented: {0}")]
     NotImplemented(String),
 }
