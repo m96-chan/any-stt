@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-linux:
+    name: Test (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libgomp1
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build (CPU only)
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+  build-linux-cuda:
+    name: Build (Linux CUDA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libgomp1
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.18
+        with:
+          cuda: '12.6.3'
+          method: network
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build with CUDA
+        run: cargo build --release -p whisper-backend --features cuda
+
+  build-android:
+    name: Build (Android aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Android NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: sdkmanager "ndk;26.3.11579264"
+
+      - name: Build for Android
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.3.11579264
+        run: |
+          NDK_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_TOOLCHAIN/bin/aarch64-linux-android35-clang"
+          export CC_aarch64_linux_android="$NDK_TOOLCHAIN/bin/aarch64-linux-android35-clang"
+          export CXX_aarch64_linux_android="$NDK_TOOLCHAIN/bin/aarch64-linux-android35-clang++"
+          export AR_aarch64_linux_android="$NDK_TOOLCHAIN/bin/llvm-ar"
+          cargo build --release --target aarch64-linux-android -p whisper-backend
+
+  build-ios:
+    name: Build (iOS aarch64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Build for iOS (Metal)
+        run: cargo build --release --target aarch64-apple-ios -p whisper-backend --features metal
+
+  build-macos:
+    name: Build + Test (macOS ARM64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build with Metal
+        run: cargo build --release -p whisper-backend --features metal
+
+      - name: Test
+        run: cargo test --workspace
+
+  # ============================================================
+  # Publish to crates.io — uncomment when ready
+  # ============================================================
+  # publish:
+  #   name: Publish to crates.io
+  #   runs-on: ubuntu-latest
+  #   needs: [test-linux, build-linux-cuda, build-android, build-ios, build-macos]
+  #   if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         submodules: recursive
+  #
+  #     - name: Install dependencies
+  #       run: |
+  #         sudo apt-get update
+  #         sudo apt-get install -y cmake libgomp1
+  #
+  #     - name: Setup Rust
+  #       uses: dtolnay/rust-toolchain@stable
+  #
+  #     # Publish order matters — dependencies first
+  #     - name: Publish any-stt
+  #       run: cargo publish -p any-stt --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+  #
+  #     - name: Publish gguf-loader
+  #       run: cargo publish -p gguf-loader --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+  #
+  #     - name: Publish qnn-backend
+  #       run: cargo publish -p qnn-backend --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+  #
+  #     # whisper-backend depends on all above + has build.rs with cmake
+  #     # Requires whisper.cpp submodule — may need vendored source or git dependency
+  #     - name: Publish whisper-backend
+  #       run: cargo publish -p whisper-backend --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
