@@ -1,4 +1,7 @@
+pub mod decoder;
 pub mod ffi;
+pub mod hybrid;
+pub mod preprocess;
 pub mod qnn;
 
 #[cfg(target_os = "android")]

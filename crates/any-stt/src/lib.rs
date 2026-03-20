@@ -36,10 +36,34 @@ pub trait SttEngine: Send + Sync {
 /// Detect hardware, select the best backend and quantization, and load a model.
 ///
 /// Returns a boxed [`SttEngine`] ready to transcribe audio.
-pub fn initialize(_config: SttConfig) -> Result<Box<dyn SttEngine>, SttError> {
-    Err(SttError::NotImplemented(
-        "no backends compiled — enable a feature flag (e.g. `cuda`, `metal`, `cpu`)".into(),
-    ))
+///
+/// On Snapdragon devices with QNN HTP, attempts to build a hybrid CPU+NPU
+/// engine. Falls back to CPU-only whisper.cpp if QNN is unavailable.
+pub fn initialize(config: SttConfig) -> Result<Box<dyn SttEngine>, SttError> {
+    let hw = detect::detect_hardware();
+    let selection = selector::select(&config, &hw);
+
+    match selection.backend {
+        Backend::Qnn => {
+            // QNN backend selected — the caller (whisper-backend) must
+            // construct WhisperQnnEngine with the appropriate model paths.
+            // This function serves as the dispatch point; the actual
+            // construction is done by the whisper-backend crate.
+            Err(SttError::NotImplemented(
+                "QNN backend selected — use whisper_backend::hybrid::WhisperQnnEngine::new() directly".into(),
+            ))
+        }
+        Backend::Cpu => {
+            // CPU fallback — caller must construct WhisperEngine.
+            Err(SttError::NotImplemented(
+                "CPU backend selected — use whisper_backend::WhisperEngine::new() directly".into(),
+            ))
+        }
+        other => Err(SttError::BackendUnavailable {
+            backend: other,
+            reason: "backend not yet implemented".into(),
+        }),
+    }
 }
 
 /// Detect hardware capabilities without loading a model.
@@ -64,13 +88,12 @@ mod tests {
     }
 
     #[test]
-    fn initialize_returns_not_implemented() {
+    fn initialize_returns_error() {
         let result = initialize(SttConfig::default());
-        match result {
-            Err(SttError::NotImplemented(_)) => {}
-            Err(other) => panic!("expected NotImplemented, got: {other}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
+        // initialize() should return an error since no real backend is wired up yet.
+        // The specific error depends on detected hardware (NotImplemented for CPU,
+        // BackendUnavailable for GPU backends).
+        assert!(result.is_err(), "expected error, got Ok");
     }
 
     #[test]

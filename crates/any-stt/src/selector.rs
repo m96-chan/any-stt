@@ -32,6 +32,7 @@ fn select_backend(config: &SttConfig, hw: &HardwareInfo) -> Backend {
         if npu.available {
             match npu.npu_type {
                 NpuType::CoreMl => return Backend::CoreMl,
+                NpuType::QnnHtp => return Backend::Qnn,
                 NpuType::Nnapi => return Backend::Nnapi,
             }
         }

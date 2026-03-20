@@ -166,4 +166,27 @@ extern "C" {
         samples: *const c_float,
         n_samples: c_int,
     ) -> c_int;
+
+    /// Set params to skip encoding (for externally-provided encoder output).
+    pub fn shim_params_set_skip_encoder(params: *mut WhisperFullParams, skip: bool);
+
+    /// Get number of audio context frames (1500 for standard whisper).
+    pub fn shim_model_n_audio_ctx(ctx: *mut WhisperContext) -> c_int;
+
+    /// Get encoder state dimension (n_state).
+    pub fn shim_model_n_audio_state(ctx: *mut WhisperContext) -> c_int;
+
+    // --- Low-level encode/decode API (for hybrid NPU+CPU pipeline) ---
+
+    /// Run the encoder on the audio features starting at the given offset.
+    pub fn whisper_encode(ctx: *mut WhisperContext, offset: c_int, n_threads: c_int) -> c_int;
+
+    /// Run the decoder to obtain logits for the next token.
+    pub fn whisper_decode(
+        ctx: *mut WhisperContext,
+        tokens: *const c_int,
+        n_tokens: c_int,
+        n_past: c_int,
+        n_threads: c_int,
+    ) -> c_int;
 }

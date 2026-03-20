@@ -77,5 +77,6 @@ pub enum Backend {
     CoreMl,
     Vulkan,
     Nnapi,
+    Qnn,
     Cpu,
 }

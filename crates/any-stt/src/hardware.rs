@@ -57,6 +57,7 @@ pub struct NpuInfo {
 pub enum NpuType {
     CoreMl,
     Nnapi,
+    QnnHtp,
 }
 
 /// Operating system information.

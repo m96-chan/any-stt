@@ -1,6 +1,7 @@
 //! QNN context management — backend + context + graph lifecycle.
 
 use std::ffi::CString;
+use std::path::Path;
 use std::ptr;
 
 use crate::loader::QnnLibrary;
@@ -121,6 +122,99 @@ impl QnnContext {
             return Err(format!("graph_execute: error {err}"));
         }
         Ok(())
+    }
+}
+
+impl QnnContext {
+    /// Save the compiled context to a binary cache file.
+    pub fn save_binary(&self, path: &Path) -> Result<(), String> {
+        let vt = self.lib.vt();
+
+        let get_size = vt
+            .context_get_binary_size
+            .ok_or("context_get_binary_size null")?;
+        let get_binary = vt
+            .context_get_binary
+            .ok_or("context_get_binary null")?;
+
+        let mut binary_size: u64 = 0;
+        let err = unsafe { get_size(self.context, &mut binary_size) };
+        if err != QNN_SUCCESS {
+            return Err(format!("context_get_binary_size: error {err}"));
+        }
+
+        let mut binary_ptr: *const std::ffi::c_void = ptr::null();
+        let mut written_size: u64 = 0;
+        let err = unsafe { get_binary(self.context, &mut binary_ptr, &mut written_size) };
+        if err != QNN_SUCCESS {
+            return Err(format!("context_get_binary: error {err}"));
+        }
+
+        if binary_ptr.is_null() || written_size == 0 {
+            return Err("context_get_binary returned null/empty".into());
+        }
+
+        let data =
+            unsafe { std::slice::from_raw_parts(binary_ptr as *const u8, written_size as usize) };
+        std::fs::write(path, data)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+
+        Ok(())
+    }
+
+    /// Create a context from a previously saved binary cache file.
+    pub fn from_binary(lib: QnnLibrary, path: &Path) -> Result<Self, String> {
+        let vt = lib.vt();
+
+        let backend_create = vt.backend_create.ok_or("backend_create null")?;
+        let mut backend: Qnn_BackendHandle_t = ptr::null_mut();
+        let err = unsafe { backend_create(ptr::null_mut(), ptr::null(), &mut backend) };
+        if err != QNN_SUCCESS {
+            return Err(format!("backend_create: error {err}"));
+        }
+
+        let create_from_binary = vt
+            .context_create_from_binary
+            .ok_or("context_create_from_binary null")?;
+
+        let data = std::fs::read(path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+
+        let mut context: Qnn_ContextHandle_t = ptr::null_mut();
+        let err = unsafe {
+            create_from_binary(
+                backend,
+                ptr::null_mut(),
+                ptr::null(),
+                data.as_ptr() as *const std::ffi::c_void,
+                data.len() as u64,
+                &mut context,
+                ptr::null_mut(),
+            )
+        };
+        if err != QNN_SUCCESS {
+            if let Some(f) = vt.backend_free {
+                unsafe { f(backend) };
+            }
+            return Err(format!("context_create_from_binary: error {err}"));
+        }
+
+        Ok(Self {
+            lib,
+            backend,
+            context,
+        })
+    }
+
+    /// Generate a cache file path based on model parameters.
+    pub fn cache_path(
+        cache_dir: &Path,
+        model_name: &str,
+        n_layer: u32,
+        n_state: u32,
+    ) -> std::path::PathBuf {
+        let api_ver = "2_35"; // QNN SDK version
+        cache_dir.join(format!("qnn_{model_name}_{n_layer}_{n_state}_{api_ver}.bin"))
     }
 }
 

@@ -64,10 +64,46 @@ void shim_params_set_suppress_nst(struct whisper_full_params *p, bool val) {
     p->suppress_nst = val;
 }
 
+/* Skip the encoder_begin_callback, causing whisper_full to skip encoding.
+ * This callback is set by shim_params_set_skip_encoder. */
+static bool shim_encoder_skip_callback(struct whisper_context *ctx,
+                                        struct whisper_state *state,
+                                        void *user_data) {
+    (void)ctx; (void)state; (void)user_data;
+    /* Returning false tells whisper_full to abort this seek iteration.
+     * However, that's NOT what we want — we want to skip encoding but
+     * still run decoding. For now, this approach won't work for whisper_full.
+     *
+     * Instead, we use the low-level whisper_encode + whisper_decode API
+     * in the Rust decoder. This callback is kept as a no-op placeholder. */
+    return true;
+}
+
+/* Set params to skip encoding (used when encoder output is externally provided). */
+void shim_params_set_skip_encoder(struct whisper_full_params *p, bool skip) {
+    if (skip) {
+        p->encoder_begin_callback = shim_encoder_skip_callback;
+        p->encoder_begin_callback_user_data = NULL;
+    } else {
+        p->encoder_begin_callback = NULL;
+        p->encoder_begin_callback_user_data = NULL;
+    }
+}
+
 /* Run whisper_full using a pointer to params (dereferences for the by-value C API). */
 int shim_whisper_full(struct whisper_context *ctx,
                       const struct whisper_full_params *params,
                       const float *samples,
                       int n_samples) {
     return whisper_full(ctx, *params, samples, n_samples);
+}
+
+/* Get the number of audio context frames (1500 for standard whisper). */
+int shim_model_n_audio_ctx(struct whisper_context *ctx) {
+    return whisper_model_n_audio_ctx(ctx);
+}
+
+/* Get the encoder state dimension (n_state). */
+int shim_model_n_audio_state(struct whisper_context *ctx) {
+    return whisper_model_n_audio_state(ctx);
 }

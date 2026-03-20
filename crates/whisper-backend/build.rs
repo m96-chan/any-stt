@@ -11,6 +11,7 @@ fn main() {
     let target = env::var("TARGET").unwrap_or_default();
     let is_android = target.contains("android");
     let is_cross = env::var("HOST").unwrap_or_default() != target;
+    let use_vulkan = env::var("CARGO_FEATURE_VULKAN").is_ok();
 
     // --- Step 1: Build whisper.cpp via cmake ---
 
@@ -29,13 +30,15 @@ fn main() {
         .define("GGML_NATIVE", if is_cross { "OFF" } else { "ON" })
         .define("GGML_CUDA", "OFF")
         .define("GGML_METAL", "OFF")
-        .define("GGML_VULKAN", "OFF")
+        .define("GGML_VULKAN", if use_vulkan { "ON" } else { "OFF" })
         .define("GGML_OPENCL", "OFF")
         .define("GGML_SYCL", "OFF")
         .define("GGML_RPC", "OFF");
 
     if is_android {
-        cfg.define("GGML_OPENMP", "OFF");
+        // OpenMP is now safe with dynamic linking (no static libc crash).
+        // This enables multi-threaded ggml-cpu on Android.
+        cfg.define("GGML_OPENMP", "ON");
         if let Ok(ndk) = env::var("ANDROID_NDK_HOME") {
             let toolchain = format!("{ndk}/build/cmake/android.toolchain.cmake");
             cfg.define("CMAKE_TOOLCHAIN_FILE", &toolchain)
@@ -88,10 +91,21 @@ fn main() {
             assert!(status.success(), "shim.so compilation failed");
         }
 
-        // Tell cargo where the .so files are (for the build to find them,
-        // even though we don't link them).
+        // Dynamic link the shared libraries.
+        // At runtime, LD_LIBRARY_PATH must point to the directory containing
+        // these .so files. This avoids the static libc getauxval crash while
+        // still resolving symbols at link time.
         if lib_dir.exists() {
             println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        }
+        println!("cargo:rustc-link-lib=dylib=whisper_shim");
+        println!("cargo:rustc-link-lib=dylib=whisper");
+        println!("cargo:rustc-link-lib=dylib=ggml");
+        println!("cargo:rustc-link-lib=dylib=ggml-base");
+        println!("cargo:rustc-link-lib=dylib=ggml-cpu");
+
+        if use_vulkan {
+            println!("cargo:rustc-link-lib=dylib=ggml-vulkan");
         }
 
         // Output the lib dir path as a cargo env var so tests can find the .so files.
@@ -125,6 +139,11 @@ fn main() {
         println!("cargo:rustc-link-lib=static=ggml");
         println!("cargo:rustc-link-lib=static=ggml-base");
         println!("cargo:rustc-link-lib=static=ggml-cpu");
+
+        if use_vulkan {
+            println!("cargo:rustc-link-lib=static=ggml-vulkan");
+            println!("cargo:rustc-link-lib=vulkan");
+        }
 
         println!("cargo:rustc-link-lib=stdc++");
         println!("cargo:rustc-link-lib=gomp");

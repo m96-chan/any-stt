@@ -69,7 +69,7 @@ pub struct Qnn_QuantizeParams_t {
 
 impl Qnn_QuantizeParams_t {
     pub fn undefined() -> Self {
-        let mut q = Self {
+        let q = Self {
             encoding_definition: QNN_DEFINITION_UNDEFINED,
             quantization_encoding: QNN_QUANTIZATION_ENCODING_UNDEFINED,
             _union: [0; 32],
@@ -158,7 +158,13 @@ impl Qnn_Tensor_t {
         Self::new(name, QNN_TENSOR_TYPE_APP_READ, rank, dimensions)
     }
 
-    fn new(name: *const c_char, tensor_type: u32, rank: u32, dimensions: *mut u32) -> Self {
+    /// Create a STATIC tensor (weights embedded in graph, preloaded to DSP).
+    /// Use `set_data` to provide the weight data before registration.
+    pub fn static_tensor(name: *const c_char, rank: u32, dimensions: *mut u32) -> Self {
+        Self::new(name, QNN_TENSOR_TYPE_STATIC, rank, dimensions)
+    }
+
+    pub(crate) fn new(name: *const c_char, tensor_type: u32, rank: u32, dimensions: *mut u32) -> Self {
         Self {
             version: QNN_TENSOR_VERSION_1,
             _pad: 0,
@@ -376,9 +382,30 @@ pub struct QnnInterfaceVtable {
         ) -> Qnn_ErrorHandle_t,
     >,
     pub context_set_config: *const c_void,
-    pub context_get_binary_size: *const c_void,
-    pub context_get_binary: *const c_void,
-    pub context_create_from_binary: *const c_void,
+    pub context_get_binary_size: Option<
+        unsafe extern "C" fn(
+            Qnn_ContextHandle_t,
+            *mut u64,
+        ) -> Qnn_ErrorHandle_t,
+    >,
+    pub context_get_binary: Option<
+        unsafe extern "C" fn(
+            Qnn_ContextHandle_t,
+            *mut *const c_void,
+            *mut u64,
+        ) -> Qnn_ErrorHandle_t,
+    >,
+    pub context_create_from_binary: Option<
+        unsafe extern "C" fn(
+            Qnn_BackendHandle_t,
+            Qnn_DeviceHandle_t,
+            *const *const QnnContext_Config_t,
+            *const c_void,
+            u64,
+            *mut Qnn_ContextHandle_t,
+            Qnn_ProfileHandle_t,
+        ) -> Qnn_ErrorHandle_t,
+    >,
     pub context_free: Option<
         unsafe extern "C" fn(Qnn_ContextHandle_t, Qnn_ProfileHandle_t) -> Qnn_ErrorHandle_t,
     >,

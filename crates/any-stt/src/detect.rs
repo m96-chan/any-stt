@@ -153,6 +153,14 @@ fn detect_npu() -> Option<NpuInfo> {
 
     #[cfg(target_os = "android")]
     {
+        // Prefer QNN HTP on Snapdragon devices (check for Hexagon DSP).
+        if detect_qnn_htp_available() {
+            return Some(NpuInfo {
+                npu_type: NpuType::QnnHtp,
+                available: true,
+            });
+        }
+        // Fallback to NNAPI.
         return Some(NpuInfo {
             npu_type: NpuType::Nnapi,
             available: true,
@@ -161,6 +169,22 @@ fn detect_npu() -> Option<NpuInfo> {
 
     #[allow(unreachable_code)]
     None
+}
+
+/// Check if QNN HTP (Hexagon) is available.
+///
+/// On Android, checks for the presence of libQnnHtp.so in known paths.
+/// On other platforms, returns false (QNN is Android/Snapdragon-only).
+#[cfg(target_os = "android")]
+fn detect_qnn_htp_available() -> bool {
+    use std::path::Path;
+    // Common locations for QNN libraries on Android
+    let candidates = [
+        "/vendor/lib64/libQnnHtp.so",
+        "/system/lib64/libQnnHtp.so",
+        "/system/vendor/lib64/libQnnHtp.so",
+    ];
+    candidates.iter().any(|p| Path::new(p).exists())
 }
 
 fn detect_os() -> OsInfo {

@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/any-stt", "crates/whisper-backend", "crates/qnn-backend"]
+members = ["crates/any-stt", "crates/whisper-backend", "crates/qnn-backend", "crates/gguf-loader", "crates/bench"]
