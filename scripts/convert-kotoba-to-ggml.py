@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Convert kotoba-whisper-v2.0 (HuggingFace) to ggml format for whisper.cpp.
 
-Usage:
-    python3 scripts/convert-kotoba-to-ggml.py [output_dir]
+Writes the ggml binary format directly, handling:
+- n_mels=128 (large-v3 spec)
+- n_text_layer=2 (distilled)
+- Correct vocab from HF tokenizer (51866 tokens)
 
-Downloads kotoba-tech/kotoba-whisper-v2.0 and converts to ggml binary format
-compatible with whisper.cpp's model loader.
+Usage:
+    python3 scripts/convert-kotoba-to-ggml.py [output_path]
+
+Requires: pip install transformers openai-whisper torch numpy
 """
 
 import sys
@@ -13,38 +17,26 @@ import struct
 import numpy as np
 from pathlib import Path
 
+
 def main():
-    output_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "third-party/whisper.cpp/models")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / "ggml-kotoba-v2.bin"
+    output_path = Path(sys.argv[1] if len(sys.argv) > 1 else
+                       "third-party/whisper.cpp/models/ggml-kotoba-v2.bin")
 
-    print("Loading kotoba-tech/kotoba-whisper-v2.0 from HuggingFace...")
+    print("Loading kotoba-tech/kotoba-whisper-v2.0...")
     from transformers import WhisperForConditionalGeneration, WhisperProcessor
+    import torch
 
-    model = WhisperForConditionalGeneration.from_pretrained("kotoba-tech/kotoba-whisper-v2.0")
-    processor = WhisperProcessor.from_pretrained("kotoba-tech/kotoba-whisper-v2.0")
-
+    model = WhisperForConditionalGeneration.from_pretrained(
+        "kotoba-tech/kotoba-whisper-v2.0")
+    processor = WhisperProcessor.from_pretrained(
+        "kotoba-tech/kotoba-whisper-v2.0")
     config = model.config
-    print(f"  n_audio_state={config.d_model}, n_audio_layer={config.encoder_layers}")
-    print(f"  n_text_state={config.d_model}, n_text_layer={config.decoder_layers}")
-    print(f"  n_audio_head={config.encoder_attention_heads}, n_text_head={config.decoder_attention_heads}")
-    print(f"  n_vocab={config.vocab_size}, n_mels={config.num_mel_bins}")
-    print(f"  n_audio_ctx={config.max_source_positions}, n_text_ctx={config.max_target_positions}")
 
-    state_dict = model.state_dict()
-
-    # Map HuggingFace key names to whisper.cpp ggml names
-    # HF format: model.encoder.layers.0.self_attn.q_proj.weight
-    # ggml format: encoder.blocks.0.attn.query.weight
-    def map_key(hf_key):
-        k = hf_key
-        # Remove "model." prefix
+    # Map HF keys → whisper.cpp ggml keys
+    def map_key(k):
         if k.startswith("model."):
             k = k[6:]
-
-        # Encoder mappings
-        k = k.replace("encoder.layers.", "encoder.blocks.")
-        k = k.replace("decoder.layers.", "decoder.blocks.")
+        k = k.replace("layers.", "blocks.")
         k = k.replace("self_attn.q_proj", "attn.query")
         k = k.replace("self_attn.k_proj", "attn.key")
         k = k.replace("self_attn.v_proj", "attn.value")
@@ -62,25 +54,18 @@ def main():
         k = k.replace("decoder.layer_norm", "decoder.ln")
         k = k.replace("encoder.embed_positions.weight", "encoder.positional_embedding")
         k = k.replace("decoder.embed_positions.weight", "decoder.positional_embedding")
-        k = k.replace("decoder.embed_tokens", "decoder.token_embedding")
-        k = k.replace("encoder.conv1", "encoder.conv1")
-        k = k.replace("encoder.conv2", "encoder.conv2")
-        k = k.replace("proj_out.weight", "decoder.proj.weight")
+        k = k.replace("decoder.embed_tokens.weight", "decoder.token_embedding.weight")
         return k
 
-    # Collect and map tensors
     tensors = {}
-    for hf_key, param in state_dict.items():
+    for hf_key, param in model.state_dict().items():
         ggml_key = map_key(hf_key)
-        data = param.detach().cpu().float().numpy()
+        if ggml_key == "proj_out.weight":
+            continue  # tied with token_embedding
+        data = param.detach().cpu().float().numpy().squeeze()
         tensors[ggml_key] = data
 
-    print(f"  {len(tensors)} tensors mapped")
-
-    # Write ggml binary format
-    # Header: magic(u32) + hparams(11 x u32) + mel_filters + vocab + tensors
-    GGML_FILE_MAGIC = 0x67676d6c  # "ggml"
-
+    # Hyperparameters
     n_vocab = config.vocab_size
     n_audio_ctx = config.max_source_positions
     n_audio_state = config.d_model
@@ -91,91 +76,100 @@ def main():
     n_text_head = config.decoder_attention_heads
     n_text_layer = config.decoder_layers
     n_mels = config.num_mel_bins
-    ftype = 1  # F16 for large tensors (but we write F32)
+    ftype = 1  # mostly F16 (large tensors in F16, bias/embed in F32)
 
-    # Actually write as ftype=0 (F32) since all tensors are F32
-    ftype = 0
+    print(f"  n_audio: ctx={n_audio_ctx} state={n_audio_state} head={n_audio_head} layer={n_audio_layer}")
+    print(f"  n_text:  ctx={n_text_ctx} state={n_text_state} head={n_text_head} layer={n_text_layer}")
+    print(f"  n_mels={n_mels} n_vocab={n_vocab} ftype={ftype}")
+    print(f"  {len(tensors)} tensors")
 
+    # Mel filters
+    import whisper
+    try:
+        mel_filters = whisper.audio.mel_filters("cpu", n_mels).numpy()
+    except TypeError:
+        mel_filters = whisper.audio.mel_filters(
+            whisper.audio.SAMPLE_RATE, whisper.audio.N_FFT, n_mels).numpy()
+    n_fft_half = mel_filters.shape[1]
+    print(f"  mel_filters: [{n_mels}, {n_fft_half}]")
+
+    # Vocab from HF tokenizer
+    tokenizer = processor.tokenizer
+    vocab_dict = tokenizer.get_vocab()
+    # Sort by token ID
+    vocab_by_id = [""] * n_vocab
+    for token, idx in vocab_dict.items():
+        if idx < n_vocab:
+            vocab_by_id[idx] = token
+    # Fill any gaps
+    for i in range(n_vocab):
+        if not vocab_by_id[i]:
+            vocab_by_id[i] = f"<extra_{i}>"
+    print(f"  vocab: {n_vocab} tokens")
+
+    # Write ggml binary
     with open(output_path, "wb") as f:
-        # Magic
-        f.write(struct.pack("<I", GGML_FILE_MAGIC))
+        # Header
+        f.write(struct.pack("i", 0x67676d6c))  # magic: "ggml"
+        for v in [n_vocab, n_audio_ctx, n_audio_state, n_audio_head, n_audio_layer,
+                  n_text_ctx, n_text_state, n_text_head, n_text_layer, n_mels, ftype]:
+            f.write(struct.pack("i", v))
 
-        # Hyperparameters
-        f.write(struct.pack("<I", n_vocab))
-        f.write(struct.pack("<I", n_audio_ctx))
-        f.write(struct.pack("<I", n_audio_state))
-        f.write(struct.pack("<I", n_audio_head))
-        f.write(struct.pack("<I", n_audio_layer))
-        f.write(struct.pack("<I", n_text_ctx))
-        f.write(struct.pack("<I", n_text_state))
-        f.write(struct.pack("<I", n_text_head))
-        f.write(struct.pack("<I", n_text_layer))
-        f.write(struct.pack("<I", n_mels))
-        f.write(struct.pack("<I", ftype))
-
-        # Mel filters — load from whisper library
-        import whisper
-        # whisper.audio.mel_filters(device, n_mels) in newer versions
-        try:
-            mel_filters = whisper.audio.mel_filters("cpu", n_mels).numpy()
-        except TypeError:
-            mel_filters = whisper.audio.mel_filters(whisper.audio.SAMPLE_RATE, whisper.audio.N_FFT, n_mels).numpy()
-        # mel_filters shape: [n_mels, n_fft/2+1]
-        n_fft_half = mel_filters.shape[1]
-        f.write(struct.pack("<I", n_mels))
-        f.write(struct.pack("<I", n_fft_half))
+        # Mel filters
+        f.write(struct.pack("i", n_mels))
+        f.write(struct.pack("i", n_fft_half))
         mel_filters.astype(np.float32).tofile(f)
-        print(f"  mel_filters: [{n_mels}, {n_fft_half}]")
 
-        # Vocab — use the tokenizer
-        tokenizer = processor.tokenizer
-        vocab = tokenizer.get_vocab()
-        # Sort by ID
-        vocab_sorted = sorted(vocab.items(), key=lambda x: x[1])
-        n_vocab_write = len(vocab_sorted)
-        f.write(struct.pack("<I", n_vocab_write))
-        for token, idx in vocab_sorted:
+        # Vocab
+        f.write(struct.pack("i", n_vocab))
+        for token in vocab_by_id:
             token_bytes = token.encode("utf-8")
-            f.write(struct.pack("<I", len(token_bytes)))
+            f.write(struct.pack("i", len(token_bytes)))
             f.write(token_bytes)
-        print(f"  vocab: {n_vocab_write} tokens")
 
-        # Tensors
-        # ggml tensor format: name_len(i32) + n_dims(i32) + [dims...](i32) + type(i32) + data(aligned)
+        # Tensors (same format as convert-pt-to-ggml.py)
         GGML_TYPE_F32 = 0
         GGML_TYPE_F16 = 1
 
         n_written = 0
         for name, data in tensors.items():
-            name_bytes = name.encode("utf-8")
             n_dims = len(data.shape)
-            # ggml format: dims are ne[0], ne[1], ... (same as numpy shape for 1D/2D)
-            # For tensors with shape [A, B, C], ggml ne = [C, B, A]
-            # But the whisper.cpp loader reads ne[i] for i in 0..n_dims
-            # and checks against the internal tensor ne which is also reversed.
-            # So we write in the same order as the original convert-pt-to-ggml.py:
-            # dims in file = reversed shape (ggml convention)
-            dims = list(reversed(data.shape))
 
-            # Determine type — use F32 for all (simplicity)
-            dtype = GGML_TYPE_F32
-            raw = data.astype(np.float32).tobytes()
+            # Small tensors stay F32, large tensors use F16
+            use_f16 = ftype == 1 and n_dims >= 2 and \
+                name != "encoder.conv1.bias" and \
+                name != "encoder.conv2.bias" and \
+                name != "encoder.positional_embedding" and \
+                name != "decoder.positional_embedding"
 
-            f.write(struct.pack("<I", n_dims))
-            f.write(struct.pack("<I", len(name_bytes)))
-            f.write(struct.pack("<I", dtype))
-            for d in dims:
-                f.write(struct.pack("<I", d))
+            if use_f16:
+                data_out = data.astype(np.float16)
+                ttype = GGML_TYPE_F16
+            else:
+                data_out = data.astype(np.float32)
+                ttype = GGML_TYPE_F32
+
+            name_bytes = name.encode("utf-8")
+
+            # Header: n_dims, name_len, ftype
+            f.write(struct.pack("iii", n_dims, len(name_bytes), ttype))
+
+            # Dimensions in reversed order (ggml convention, same as official converter)
+            for i in range(n_dims):
+                f.write(struct.pack("i", data.shape[n_dims - 1 - i]))
+
+            # Name
             f.write(name_bytes)
 
-            # No alignment padding — whisper.cpp reads data immediately after name
-            f.write(raw)
+            # Data (no alignment padding — whisper.cpp reads immediately)
+            data_out.tofile(f)
             n_written += 1
 
         print(f"  {n_written} tensors written")
 
     size_mb = output_path.stat().st_size / 1024 / 1024
     print(f"\nWritten: {output_path} ({size_mb:.0f} MB)")
+
 
 if __name__ == "__main__":
     main()
