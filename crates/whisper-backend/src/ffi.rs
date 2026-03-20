@@ -176,6 +176,26 @@ extern "C" {
     /// Get encoder state dimension (n_state).
     pub fn shim_model_n_audio_state(ctx: *mut WhisperContext) -> c_int;
 
+    // --- Encoder output injection (for hybrid NPU+CPU pipeline) ---
+
+    /// Get pointer to internal encoder output tensor data.
+    /// Returns null if encoder hasn't been run yet.
+    pub fn whisper_get_encoder_output(
+        ctx: *mut WhisperContext,
+        n_ctx: *mut c_int,
+        n_state: *mut c_int,
+    ) -> *mut c_float;
+
+    /// Set encoder output from external source (e.g., NPU).
+    /// Copies n_ctx*n_state floats into the internal embd_enc tensor.
+    /// Returns 0 on success, -1 on failure.
+    pub fn whisper_set_encoder_output(
+        ctx: *mut WhisperContext,
+        data: *const c_float,
+        n_ctx: c_int,
+        n_state: c_int,
+    ) -> c_int;
+
     // --- Low-level encode/decode API (for hybrid NPU+CPU pipeline) ---
 
     /// Run the encoder on the audio features starting at the given offset.
