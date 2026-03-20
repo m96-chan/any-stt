@@ -3,272 +3,272 @@
 Cross-platform Speech-to-Text engine for Rust.
 Detects hardware (CPU/GPU/NPU) and OS at runtime, then selects the optimal acceleration backend automatically.
 
+## Benchmark Results
+
+Measured on real devices. All times are median of 5 runs.
+
+### tiny.en (77 MB) — JFK inaugural 11.0s
+
+| Platform | Backend | Median | RTF |
+|----------|---------|--------|-----|
+| Linux (RTX 5090) | CUDA | **23ms** | 0.002 |
+| Linux (RTX 5090) | Vulkan | 23ms | 0.002 |
+| Linux (Ryzen 9950X3D) | CPU AVX-512 | 169ms | 0.015 |
+| Android (SD 8 Gen 3) | NPU INT8 + CPU | **162ms** | 0.015 |
+| Android (SD 8 Gen 3) | CPU NEON 8T | 851ms | 0.077 |
+
+### Large-v2 / Kotoba (3.1 GB) — Japanese 7.4s
+
+| Platform | Backend | Median | RTF |
+|----------|---------|--------|-----|
+| Linux (RTX 5090) | CUDA | **99ms** | 0.013 |
+| Linux (RTX 5090) | Vulkan | 106ms | 0.014 |
+| Linux (Ryzen 9950X3D) | CPU AVX-512 | 6836ms | 0.928 |
+| Android (SD 8 Gen 3) | NPU INT8 + CPU | **5.4s** | **0.73** |
+| Android (SD 8 Gen 3) | CPU NEON 8T | 66.6s | 9.05 |
+
+> Output: "我輩は猫である。名前はまだない。どこで生まれたかとんと見当がつかぬ。"
+> Output MATCH verified between CPU and hybrid (NPU+CPU) paths.
+
 ## Target Platforms
 
-| Platform       | Arch   | Acceleration                          |
-|----------------|--------|---------------------------------------|
-| Linux          | x86_64 | CUDA, Vulkan†, CPU (AVX2/AVX-512)    |
-| macOS          | ARM64  | CoreML, Metal, CPU (NEON)             |
-| Android        | ARM64  | NNAPI, CPU (NEON), Vulkan†(opt-in)    |
-| iOS            | ARM64  | CoreML, Metal, CPU (NEON)             |
-
-> †Vulkan: shader pre-compilation required (see [Vulkan Caveats](#vulkan-caveats))
-
-## How It Works
-
-```
-Audio in ──► any-stt::initialize(config)
-                │
-                ├─ 1. Detect hardware
-                │     CPU: flags (AVX-512, NEON, etc.)
-                │     GPU: vendor, VRAM, driver
-                │     NPU: CoreML / NNAPI availability
-                │
-                ├─ 2. Score acceleration backends
-                │     Each backend reports: supported? + estimated throughput
-                │     Rank: NPU > GPU > CPU (with model-size awareness)
-                │
-                ├─ 3. Select model quantization
-                │     VRAM/RAM budget → best quantization that fits
-                │     e.g. 32GB VRAM → f16, 8GB → q5_0, 4GB → q4_0
-                │
-                └─ 4. Build engine
-                      Load model with chosen backend + quantization
-                      Return Box<dyn SttEngine>
-
-engine.transcribe(&audio) ──► SttResult { text, language, duration_ms }
-```
+| Platform | Arch | Acceleration | Status |
+|----------|------|-------------|--------|
+| **Linux** | x86_64 | CUDA, Vulkan, CPU (AVX2/AVX-512) | ✅ Tested on RTX 5090 + Ryzen 9950X3D |
+| **Android** | ARM64 | QNN NPU (Hexagon HTP), CPU (NEON) | ✅ Tested on REDMAGIC 9 Pro (SD 8 Gen 3) |
+| **iOS** | ARM64 | CoreML (ANE), Metal, CPU (NEON) | ✅ Implemented, pending device test |
+| **macOS** | ARM64 | CoreML (ANE), Metal, CPU (NEON) | ✅ Implemented, pending device test |
 
 ## Architecture
 
 ```
+Audio PCM f32
+    ↓
+any-stt::initialize(config)
+    ├── 1. Detect hardware (CPU/GPU/NPU/RAM)
+    ├── 2. Select backend (NPU > GPU > CPU)
+    ├── 3. Select quantization (fits available memory)
+    └── 4. Build engine → Box<dyn SttEngine>
+            ↓
+engine.transcribe(&audio) → SttResult { text, language, duration_ms }
+```
+
+### Heterogeneous CPU+NPU Pipeline (Android/Snapdragon)
+
+```
+Audio PCM
+    ↓
+┌── Preprocessor (CPU) ────────────────┐
+│  mel spectrogram → Conv1d → GELU     │  whisper.cpp handles mel+conv
+│  → Conv1d → GELU → + pos_embed      │
+└──────────────────────────────────────┘
+    ↓
+┌── Encoder (NPU via QNN HTP) ─────────┐
+│  4-32 transformer blocks (MatMul)    │  INT8 on Hexagon HMX
+│  5.7x speedup over FP32             │
+└──────────────────────────────────────┘
+    ↓
+┌── Decoder (CPU) ─────────────────────┐
+│  whisper.cpp autoregressive decoder  │  skip_encode mode
+│  with injected encoder output        │
+└──────────────────────────────────────┘
+    ↓
+SttResult { text, language, duration_ms }
+```
+
+### Crate Structure
+
+```
 any-stt/
   crates/
-    any-stt/                  # Core: trait, config, hardware detection, backend selection
-      src/
-        lib.rs                # pub trait SttEngine, initialize()
-        config.rs             # SttConfig
-        detect.rs             # Hardware detection (CPU features, GPU, NPU)
-        selector.rs           # Backend scoring and selection logic
-
-    whisper-backend/          # whisper.cpp unified backend (C FFI, not whisper-rs)
-      src/
-        lib.rs                # WhisperEngine: dispatches to acceleration
-        ffi.rs                # Raw C bindings to whisper.h (cc/cmake build)
-        accel/
-          cpu.rs              # ggml CPU (AVX2, AVX-512, NEON, SVE)
-          cuda.rs             # NVIDIA CUDA (Linux)
-          metal.rs            # Apple Metal (macOS, iOS)
-          vulkan.rs           # Vulkan (Linux desktop, Android opt-in)
-          coreml.rs           # Apple CoreML / Neural Engine (macOS, iOS)
-          nnapi.rs            # Android NNAPI / Hexagon NPU
-      build.rs                # Compiles whisper.cpp from source via cc crate
+    any-stt/            # Core: SttEngine trait, config, hardware detection, backend selection
+    whisper-backend/    # whisper.cpp FFI, WhisperEngine, WhisperQnnEngine (hybrid)
+    qnn-backend/        # Qualcomm QNN HTP: dlopen loader, graph builder, encoder, ops
+    gguf-loader/        # GGUF v3 parser (memmap2 zero-copy, F32/F16/Q8_0/Q4_0/Q5_0)
+    bench/              # Cross-platform benchmark tool
 
   third-party/
-    whisper.cpp/              # git submodule: m96-chan/whisper.cpp (fork)
+    whisper.cpp/        # Fork with encoder output injection API (skip_encode, get/set_encoder_output)
+
+  scripts/
+    bench-device.sh     # Android adb deploy + bench
+    build-ios.sh        # iOS cross-compilation
+    convert-to-gguf.py  # OpenAI whisper → GGUF v3
+    convert-kotoba-to-ggml.py  # Kotoba HuggingFace → ggml
+    dump_encoder_weights.py    # Weight dump for NPU testing
 ```
 
-## Supported Models
-
-All Whisper-architecture models in ggml format. Auto-downloads via Hugging Face Hub.
-
-### OpenAI Whisper
-
-| Model          | Params | En WER | Multilingual | Notes                    |
-|----------------|--------|--------|--------------|--------------------------|
-| tiny           | 39M    | ~7.7%  | yes          | Fastest, lowest accuracy |
-| tiny.en        | 39M    | ~6.4%  | no           |                          |
-| base           | 74M    | ~5.7%  | yes          |                          |
-| base.en        | 74M    | ~4.9%  | no           |                          |
-| small          | 244M   | ~4.3%  | yes          | Good balance             |
-| small.en       | 244M   | ~3.8%  | no           |                          |
-| medium         | 769M   | ~3.5%  | yes          |                          |
-| medium.en      | 769M   | ~3.2%  | no           |                          |
-| large-v1       | 1550M  | ~2.9%  | yes          |                          |
-| large-v2       | 1550M  | ~2.7%  | yes          |                          |
-| large-v3       | 1550M  | ~2.5%  | yes          | Best accuracy            |
-| large-v3-turbo | 809M   | ~2.6%  | yes          | large-v3 speed, ~medium size |
-
-### Distil-Whisper (Distilled)
-
-| Model              | Base       | Speedup | Notes                          |
-|--------------------|------------|---------|--------------------------------|
-| distil-large-v2    | large-v2   | ~6x     | English, near-original quality |
-| distil-large-v3    | large-v3   | ~6x     | English                        |
-| distil-medium.en   | medium.en  | ~4x     | English, compact               |
-| distil-small.en    | small.en   | ~3x     | English, smallest distilled    |
-
-### Japanese-Optimized
-
-| Model              | Base       | Ja CER | Notes                         |
-|--------------------|------------|--------|-------------------------------|
-| kotoba-whisper-v1.0| large-v2   | ~5%    | Distilled for Japanese        |
-| kotoba-whisper-v2.0| large-v3   | ~3%    | Best Japanese accuracy        |
-
-### Quantization Formats (ggml)
-
-| Format | Bits | Size vs f16 | Quality Loss | Use Case                      |
-|--------|------|-------------|--------------|-------------------------------|
-| f16    | 16   | 1.0x        | none         | Max quality, needs most VRAM  |
-| q8_0   | 8    | ~0.5x       | negligible   | Quality-first with less RAM   |
-| q5_1   | 5    | ~0.35x      | very small   | Balanced                      |
-| q5_0   | 5    | ~0.33x      | small        | Default recommendation        |
-| q4_1   | 4    | ~0.28x      | moderate     | Low memory                    |
-| q4_0   | 4    | ~0.25x      | moderate     | Minimum memory                |
-
-## Acceleration Backends
-
-### Selection Priority
+## Backend Selection
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│ Platform   │  1st choice    │ 2nd choice  │ Fallback     │
-├──────────────────────────────────────────────────────────┤
-│ Linux      │ CUDA (NVIDIA)  │ Vulkan†     │ CPU AVX-512  │
-│ macOS      │ CoreML (ANE)   │ Metal       │ CPU NEON     │
-│ Android    │ NNAPI (NPU)    │ CPU NEON    │ Vulkan‡      │
-│ iOS        │ CoreML (ANE)   │ Metal       │ CPU NEON     │
-└──────────────────────────────────────────────────────────┘
-† Vulkan selected only when shader cache is warm (see below)
-‡ Android Vulkan: opt-in only — never auto-selected (see below)
+┌──────────────────────────────────────────────────────────────┐
+│ Platform   │ 1st choice       │ 2nd choice   │ Fallback     │
+├──────────────────────────────────────────────────────────────┤
+│ Linux      │ CUDA (NVIDIA)    │ Vulkan (AMD) │ CPU AVX-512  │
+│ macOS      │ CoreML (ANE)     │ Metal        │ CPU NEON     │
+│ Android    │ QNN HTP (NPU)    │ CPU NEON     │ —            │
+│ iOS        │ CoreML (ANE)     │ Metal        │ CPU NEON     │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-> **Why is GPU off by default on Android?**
-> Mobile apps typically use the GPU for 3D rendering. Vulkan STT inference would
-> compete for the GPU and stall the render pipeline. NNAPI delegates to a dedicated
-> NPU with zero GPU contention, making it the right default.
->
-> If your app has no 3D rendering or you can afford GPU contention, explicitly set
-> `backend: Some(Backend::Vulkan)` to opt in.
+GPU auto-detection on Linux:
+- **NVIDIA**: nvidia-smi → CUDA auto-selected
+- **AMD**: sysfs `/sys/class/drm` vendor `0x1002` → Vulkan (with `allow_cold_vulkan: true`)
+- **Intel Arc**: sysfs vendor `0x8086` → Vulkan
 
-### Backend Details
+## Quick Start
 
-**CUDA** — NVIDIA GPUs (Linux)
-- whisper.cpp `GGML_CUDA` — offloads matmul to GPU
-- Requires: CUDA toolkit, NVIDIA driver
-- RTX 5090 (32GB): large-v3 f16 real-time factor <0.1x
+### Linux (NVIDIA CUDA)
 
-**Metal** — Apple GPU (macOS, iOS)
-- whisper.cpp `GGML_METAL` — GPU compute shaders
-- M-series: unified memory, no copy overhead
+```bash
+# Build with CUDA
+CUDA_HOME=/usr/local/cuda cargo build --release -p bench --features cuda
 
-**CoreML** — Apple Neural Engine (macOS, iOS)
-- whisper.cpp `WHISPER_COREML` — encoder offloaded to ANE
-- Lowest power, highest efficiency on Apple Silicon
-- Requires .mlmodelc companion files
+# Benchmark
+cargo run -p bench --release --features cuda -- \
+  --model models/ggml-tiny.en.bin \
+  --audio samples/jfk.wav \
+  --backend gpu --runs 5
+```
 
-**Vulkan** — GPU acceleration (Linux desktop, Android opt-in) {#vulkan-caveats}
-- whisper.cpp `GGML_VULKAN` — portable GPU acceleration
-- Linux: NVIDIA, AMD, Intel Arc
-- Android: available but **never auto-selected** — must be explicitly requested via `backend: Some(Backend::Vulkan)`
-  - Faster than CPU when opted in — worthwhile if GPU headroom exists
-  - GPU is typically occupied by 3D rendering; Vulkan STT will compete for GPU and may stall rendering
-  - Use when your app has no 3D workload or GPU is otherwise idle
-- **Shader compilation caveat** — first run compiles SPIR-V → device-specific shaders,
-  causing multi-second startup delay. Mitigations:
-  - `VkPipelineCache`: persist compiled shaders to disk, warm on subsequent launches
-  - Ship pre-compiled pipeline cache per GPU vendor where possible
-  - Selector falls back to CPU if shader cache is cold and `config.allow_cold_vulkan == false` (default)
+### Linux (CPU only)
 
-**NNAPI** — Android Neural Networks API
-- Delegates to on-device NPU (Hexagon, Samsung NPU, etc.)
-- Best battery efficiency on Android
+```bash
+cargo build --release -p bench
+cargo run -p bench --release -- \
+  --model models/ggml-tiny.en.bin \
+  --audio samples/jfk.wav \
+  --backend cpu --runs 5
+```
 
-**CPU** — Universal fallback
-- x86: AVX2 (most), AVX-512 (Zen 5, Intel server)
-- ARM: NEON (all ARM64), SVE (server ARM)
-- Always available, multi-threaded via ggml thread pool
+### Android (Snapdragon + QNN NPU)
+
+```bash
+# Cross-compile and deploy via adb
+./scripts/bench-device.sh -t 1 --backend all --runs 5
+
+# Requires:
+#   ANDROID_NDK_HOME set
+#   QNN SDK libs on device (/data/local/tmp/qnn/)
+#   adb connected
+```
+
+### iOS (Metal + CoreML)
+
+```bash
+# On macOS with Xcode
+./scripts/build-ios.sh          # Metal only
+./scripts/build-ios.sh --coreml # Metal + CoreML
+```
+
+### Japanese (Large-v2)
+
+```bash
+# Download large-v2 model
+cd third-party/whisper.cpp && bash models/download-ggml-model.sh large-v2
+
+# Benchmark with Japanese audio
+cargo run -p bench --release --features cuda -- \
+  --model models/ggml-large-v2.bin \
+  --audio samples/japanese_test.wav \
+  --lang ja --runs 3
+```
 
 ## API
 
 ```rust
-pub struct SttConfig {
-    pub language: String,                // "ja", "en", etc.
-    pub model: Model,                    // Model::LargeV3Turbo, Model::KotobaV2, etc.
-    pub model_path: Option<PathBuf>,     // Override: custom model path
-    pub quantization: Option<Quantization>, // Override: None = auto-select
-    pub backend: Option<Backend>,        // Override: None = auto-select
-    pub sample_rate: u32,                // default: 16000
-    pub allow_cold_vulkan: bool,         // default: false — skip Vulkan if shader cache missing
-}
-
-pub enum Model {
-    Tiny, TinyEn, Base, BaseEn,
-    Small, SmallEn, Medium, MediumEn,
-    LargeV1, LargeV2, LargeV3, LargeV3Turbo,
-    DistilLargeV2, DistilLargeV3, DistilMediumEn, DistilSmallEn,
-    KotobaV1, KotobaV2,
-    Custom(String),  // HuggingFace model ID
-}
-
-pub enum Quantization { F16, Q8_0, Q5_1, Q5_0, Q4_1, Q4_0 }
-
-pub enum Backend { Cuda, Metal, CoreMl, Vulkan, Nnapi, Cpu }
-
-pub struct HardwareInfo {
-    pub cpu: CpuInfo,       // arch, features (AVX-512, NEON, etc.), cores
-    pub gpu: Option<GpuInfo>, // vendor, name, vram_mb, driver
-    pub npu: Option<NpuInfo>, // type (CoreML, NNAPI), available
-    pub os: OsInfo,         // platform, version
-    pub available_ram_mb: u64,
-}
-
-pub struct SttResult {
-    pub text: String,
-    pub language: String,
-    pub duration_ms: f64,
-    pub backend_used: Backend,
-}
-
-pub trait SttEngine: Send + Sync {
-    fn transcribe(&self, audio: &[f32]) -> Result<SttResult, SttError>;
-    fn is_ready(&self) -> bool;
-    fn hardware_info(&self) -> &HardwareInfo;
-    fn active_backend(&self) -> Backend;
-}
-
-/// Detects hardware, selects best backend + quantization, loads model.
-pub fn initialize(config: SttConfig) -> Result<Box<dyn SttEngine>, SttError>;
-
-/// Returns hardware info without loading a model.
-pub fn detect_hardware() -> HardwareInfo;
-```
-
-## Usage
-
-```rust
+use whisper_backend::initialize;
 use any_stt::{SttConfig, SttEngine, Model};
 
-// Auto-detect everything: best backend, best quantization for available hardware
-let engine = any_stt::initialize(SttConfig {
+// Auto-detect: best backend + quantization for available hardware
+let config = SttConfig {
     language: "ja".into(),
-    model: Model::KotobaV2,
+    model: Model::LargeV2,
+    model_path: Some("models/ggml-large-v2.bin".into()),
     ..Default::default()
-})?;
+};
 
-println!("Backend: {:?}", engine.active_backend());  // e.g. Cuda
-println!("Hardware: {:?}", engine.hardware_info());
+let engine = initialize(&config)?;
+// → "initialize: using QNN NPU backend" (on Snapdragon)
+// → "initialize: using CUDA backend" (on NVIDIA Linux)
+// → "initialize: using CPU backend" (fallback)
 
-let result = engine.transcribe(&audio_samples)?;
+let result = engine.transcribe(&audio_f32)?;
 println!("{}", result.text);
+// → "我輩は猫である。名前はまだない。どこで生まれたかとんと見当がつかぬ。"
 ```
+
+### Error Handling
+
+```rust
+// NPU failure → transparent CPU fallback (no error)
+// Model not found → SttError::ModelNotFound
+// Empty audio → SttError::InvalidAudio
+// All errors are non-panic, returned as Result
+```
+
+### Feature Flags
 
 ```toml
 [dependencies]
-any-stt = { git = "https://github.com/m96-chan/any-stt" }
+whisper-backend = { path = "crates/whisper-backend" }
 
-# Enable specific backends (default: cpu only)
-[features]
-default = ["cpu"]
-cuda = ["any-stt/cuda"]
-metal = ["any-stt/metal"]
-coreml = ["any-stt/coreml"]
-vulkan = ["any-stt/vulkan"]
-nnapi = ["any-stt/nnapi"]
-all-backends = ["cuda", "metal", "coreml", "vulkan", "nnapi"]
+# Enable acceleration backends
+# whisper-backend features: cuda, vulkan, metal, coreml
 ```
 
+## Supported Models
+
+All Whisper-architecture models in ggml/GGUF format.
+
+| Model | Params | Size (F16) | Quality | Notes |
+|-------|--------|-----------|---------|-------|
+| tiny.en | 39M | 77 MB | Good (English) | Fastest |
+| small | 244M | 500 MB | Better | Good balance |
+| large-v2 | 1550M | 3.1 GB | Best | Kotoba base |
+| large-v3-turbo | 809M | 1.6 GB | Near-best | Speed+quality |
+| kotoba-v2.0 | 1550M | 1.4 GB (F16) | Best Japanese | Distilled decoder |
+
+### GGUF Conversion
+
+```bash
+# OpenAI whisper → GGUF v3
+python3 scripts/convert-to-gguf.py tiny.en output.gguf
+
+# Kotoba (HuggingFace) → ggml
+python3 scripts/convert-kotoba-to-ggml.py
+```
+
+## Tests
+
+85 tests across all crates:
+
+```
+any-stt:         25 (detection, selection, iOS/macOS/Android/Linux)
+whisper-backend: 29 (FFI, engine, hybrid, error handling, initialize)
+qnn-backend:      6 (dlopen, MatMul, probe)
+gguf-loader:      3 (parser, F16)
+layer-reference: 20 (per-layer Python fixture comparison)
+bench:            1 (doctest)
+transcribe:       1 (E2E JFK)
+```
+
+```bash
+cargo test --workspace
+```
+
+## Issues
+
+| # | Platform | Status |
+|---|----------|--------|
+| [#4](https://github.com/m96-chan/any-stt/issues/4) | Android ARM64: CPU + QNN NPU | ✅ RTF 0.73 (Large-v2) |
+| [#5](https://github.com/m96-chan/any-stt/issues/5) | iOS ARM64: Metal + CoreML + CPU | ✅ Implemented |
+| [#6](https://github.com/m96-chan/any-stt/issues/6) | Linux x86_64: CUDA + Vulkan + CPU | ✅ RTF 0.013 (Large-v2) |
+| [#7](https://github.com/m96-chan/any-stt/issues/7) | macOS ARM64: Metal + CoreML + CPU | ✅ Implemented |
+| [#8](https://github.com/m96-chan/any-stt/issues/8) | Linux: Intel NPU + AMD XDNA | 📋 Planned |
+
 ## Related
+
 - [any-miotts](https://github.com/m96-chan/any-miotts) — TTS engine (same pattern)
-- [whisper.cpp](https://github.com/m96-chan/whisper.cpp) — Maintained fork, included as git submodule in `third-party/`
+- [whisper.cpp](https://github.com/m96-chan/whisper.cpp) — Fork with encoder output injection API
 - [kotoba-whisper](https://huggingface.co/kotoba-tech/kotoba-whisper-v2.0) — Japanese ASR model
