@@ -60,7 +60,7 @@ fn main() {
 
         match backend {
             BenchBackend::Cpu => {
-                match bench_whisper_cpp(&args.model, &audio, false, args.runs) {
+                match bench_whisper_cpp(&args.model, &audio, false, args.runs, &args.language) {
                     Ok(r) => { print_result(&r); results.push(r); }
                     Err(e) => eprintln!("  SKIP: {e}"),
                 }
@@ -85,7 +85,7 @@ fn main() {
                 }
             }
             BenchBackend::Hybrid => {
-                match bench_hybrid(&args.model, &audio, args.runs) {
+                match bench_hybrid(&args.model, &audio, args.runs, &args.language) {
                     Ok(r) => { print_result(&r); results.push(r); }
                     Err(e) => eprintln!("  SKIP: {e}"),
                 }
@@ -115,11 +115,12 @@ fn bench_whisper_cpp(
     audio: &[f32],
     use_gpu: bool,
     runs: usize,
+    lang: &str,
 ) -> Result<BenchResult, String> {
     let hw = any_stt::detect_hardware();
     let backend = if use_gpu { Backend::Vulkan } else { Backend::Cpu };
 
-    let engine = WhisperEngine::new(model_path, "en", backend, hw)
+    let engine = WhisperEngine::new(model_path, lang, backend, hw)
         .map_err(|e| format!("{e}"))?;
 
     // Warmup
@@ -201,86 +202,154 @@ fn bench_npu_encoder(
         eprintln!("  (dummy weights — push weights_tiny_en/ to device for real data)");
     }
 
-    // Build single MatMul graph: [nc,ns] × [ns,ns] → [nc,ns]
-    let ctx = QnnContext::new(lib).map_err(|e| format!("QNN context: {e}"))?;
-    let graph = ctx.create_graph("mm_bench").map_err(|e| format!("graph: {e}"))?;
-
+    // Build and bench both FP32 and INT8 MatMul graphs
     let pkg = CString::new("qti.aisw").unwrap();
     let mm_type = CString::new("MatMul").unwrap();
     let tp0 = CString::new("transpose_in0").unwrap();
     let tp1 = CString::new("transpose_in1").unwrap();
+    let ops_per_pass = nl * 6;
 
-    let an = CString::new("a").unwrap();
-    let bn = CString::new("b").unwrap();
-    let cn = CString::new("c").unwrap();
+    // ===== FP32 MatMul =====
+    eprintln!("  [FP32] building MatMul graph...");
+    let ctx_fp32 = QnnContext::new(QnnLibrary::load_htp().unwrap()).map_err(|e| format!("{e}"))?;
+    let g_fp32 = ctx_fp32.create_graph("mm_fp32").map_err(|e| format!("{e}"))?;
+    let an = CString::new("a_fp32").unwrap();
+    let bn = CString::new("b_fp32").unwrap();
+    let cn = CString::new("c_fp32").unwrap();
     let mut ad = [nc as u32, ns as u32];
     let mut bd = [ns as u32, ns as u32];
     let mut cd = [nc as u32, ns as u32];
     let mut ta = Qnn_Tensor_t::app_write(an.as_ptr(), 2, ad.as_mut_ptr());
     let mut tb = Qnn_Tensor_t::app_write(bn.as_ptr(), 2, bd.as_mut_ptr());
     let mut tc = Qnn_Tensor_t::app_read(cn.as_ptr(), 2, cd.as_mut_ptr());
-    ctx.register_tensor(graph, &mut ta)?;
-    ctx.register_tensor(graph, &mut tb)?;
-    ctx.register_tensor(graph, &mut tc)?;
-
-    let nn = CString::new("mm").unwrap();
-    let mut params = [
+    ctx_fp32.register_tensor(g_fp32, &mut ta)?;
+    ctx_fp32.register_tensor(g_fp32, &mut tb)?;
+    ctx_fp32.register_tensor(g_fp32, &mut tc)?;
+    let nn = CString::new("mm_fp32").unwrap();
+    let mut p = [
         Qnn_Param_t::scalar(tp0.as_ptr(), Qnn_Scalar_t::bool8(false)),
         Qnn_Param_t::scalar(tp1.as_ptr(), Qnn_Scalar_t::bool8(false)),
     ];
-    let mut ins = [ta, tb];
-    let mut outs = [tc];
-    let op = Qnn_OpConfig_t::new(
-        nn.as_ptr(), pkg.as_ptr(), mm_type.as_ptr(),
-        &mut params, &mut ins, &mut outs,
-    );
-    ctx.add_node(graph, op)?;
-    ctx.finalize_graph(graph)?;
+    let mut ins_fp32 = [ta, tb];
+    let mut outs_fp32 = [tc];
+    let op = Qnn_OpConfig_t::new(nn.as_ptr(), pkg.as_ptr(), mm_type.as_ptr(), &mut p, &mut ins_fp32, &mut outs_fp32);
+    ctx_fp32.add_node(g_fp32, op)?;
+    ctx_fp32.finalize_graph(g_fp32)?;
 
-    let mut ei = unsafe {[ std::ptr::read(&ins[0]), std::ptr::read(&ins[1]) ]};
-    let mut eo = unsafe {[ std::ptr::read(&outs[0]) ]};
+    let mut ei_fp32 = unsafe {[ std::ptr::read(&ins_fp32[0]), std::ptr::read(&ins_fp32[1]) ]};
+    let mut eo_fp32 = unsafe {[ std::ptr::read(&outs_fp32[0]) ]};
+    let mut input_f32 = vec![0.01f32; nc * ns];
+    let mut weight_f32 = vec![0.01f32; ns * ns];
+    let mut output_f32 = vec![0.0f32; nc * ns];
 
-    let mut input_data = load_f32("encoder_input.bin");
-    if input_data.len() != nc * ns { input_data = vec![0.01f32; nc * ns]; }
-    let mut weight_data = load_f32("block0_wq.bin");
-    if weight_data.len() != ns * ns { weight_data = vec![0.01f32; ns * ns]; }
-    let mut output_data = vec![0.0f32; nc * ns];
+    eprintln!("  [FP32] warmup...");
+    ei_fp32[0].set_data(&mut input_f32);
+    ei_fp32[1].set_data(&mut weight_f32);
+    eo_fp32[0].set_data(&mut output_f32);
+    let _ = ctx_fp32.execute(g_fp32, &mut ei_fp32, &mut eo_fp32);
 
-    // Warmup
-    eprintln!("  warmup...");
-    ei[0].set_data(&mut input_data);
-    ei[1].set_data(&mut weight_data);
-    eo[0].set_data(&mut output_data);
-    let _ = ctx.execute(graph, &mut ei, &mut eo);
-
-    // Per encoder pass = 24 MatMul ops (4 layers × 6 matmuls: Q,K,V,out,fc1,fc2)
-    let ops_per_pass = nl * 6;
-    eprintln!("  {} MatMul executions per encoder pass ({nl} layers × 6 ops)", ops_per_pass);
-
-    let mut timings = Vec::with_capacity(runs);
+    eprintln!("  [FP32] {} ops per encoder pass", ops_per_pass);
+    let mut fp32_timings = Vec::with_capacity(runs);
     for i in 0..runs {
         let start = Instant::now();
         for _ in 0..ops_per_pass {
-            ei[0].set_data(&mut input_data);
-            ei[1].set_data(&mut weight_data);
-            eo[0].set_data(&mut output_data);
-            ctx.execute(graph, &mut ei, &mut eo)
-                .map_err(|e| format!("execute: {e}"))?;
+            ei_fp32[0].set_data(&mut input_f32);
+            ei_fp32[1].set_data(&mut weight_f32);
+            eo_fp32[0].set_data(&mut output_f32);
+            ctx_fp32.execute(g_fp32, &mut ei_fp32, &mut eo_fp32).map_err(|e| format!("fp32: {e}"))?;
         }
         let ms = start.elapsed().as_secs_f64() * 1000.0;
-        timings.push(ms);
-        eprintln!("  run {}: {:.1}ms ({} ops × {:.2}ms/op)",
-            i + 1, ms, ops_per_pass, ms / ops_per_pass as f64);
+        fp32_timings.push(ms);
+        eprintln!("  [FP32] run {}: {:.1}ms ({:.2}ms/op)", i + 1, ms, ms / ops_per_pass as f64);
+    }
+    fp32_timings.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let fp32_median = fp32_timings[fp32_timings.len() / 2];
+
+    // ===== INT8 (UFIXED_POINT_8) MatMul =====
+    eprintln!("  [INT8] building quantized MatMul graph...");
+    let ctx_i8 = QnnContext::new(QnnLibrary::load_htp().unwrap()).map_err(|e| format!("{e}"))?;
+    let g_i8 = ctx_i8.create_graph("mm_int8").map_err(|e| format!("{e}"))?;
+
+    // Quantization params: scale=0.01, offset=128 (symmetric around 128 for unsigned)
+    let scale = 0.01f32;
+    let offset = 128i32;
+    let an8 = CString::new("a_i8").unwrap();
+    let bn8 = CString::new("b_i8").unwrap();
+    let cn8 = CString::new("c_i8").unwrap();
+    let mut ad8 = [nc as u32, ns as u32];
+    let mut bd8 = [ns as u32, ns as u32];
+    let mut cd8 = [nc as u32, ns as u32];
+    let mut ta8 = Qnn_Tensor_t::app_write_quant_u8(an8.as_ptr(), 2, ad8.as_mut_ptr(), scale, offset);
+    let mut tb8 = Qnn_Tensor_t::app_write_quant_u8(bn8.as_ptr(), 2, bd8.as_mut_ptr(), scale, offset);
+    let mut tc8 = Qnn_Tensor_t::app_read_quant_u8(cn8.as_ptr(), 2, cd8.as_mut_ptr(), scale * scale * ns as f32, 0);
+    ctx_i8.register_tensor(g_i8, &mut ta8)?;
+    ctx_i8.register_tensor(g_i8, &mut tb8)?;
+    ctx_i8.register_tensor(g_i8, &mut tc8)?;
+
+    let nn8 = CString::new("mm_int8").unwrap();
+    let mut p8 = [
+        Qnn_Param_t::scalar(tp0.as_ptr(), Qnn_Scalar_t::bool8(false)),
+        Qnn_Param_t::scalar(tp1.as_ptr(), Qnn_Scalar_t::bool8(false)),
+    ];
+    let mut ins_i8 = [ta8, tb8];
+    let mut outs_i8 = [tc8];
+    let op8 = Qnn_OpConfig_t::new(nn8.as_ptr(), pkg.as_ptr(), mm_type.as_ptr(), &mut p8, &mut ins_i8, &mut outs_i8);
+    ctx_i8.add_node(g_i8, op8).map_err(|e| format!("int8 add_node: {e}"))?;
+    ctx_i8.finalize_graph(g_i8).map_err(|e| format!("int8 finalize: {e}"))?;
+
+    let mut ei_i8 = unsafe {[ std::ptr::read(&ins_i8[0]), std::ptr::read(&ins_i8[1]) ]};
+    let mut eo_i8 = unsafe {[ std::ptr::read(&outs_i8[0]) ]};
+    let mut input_u8 = vec![128u8; nc * ns];  // quantized zero
+    let mut weight_u8 = vec![129u8; ns * ns]; // quantized ~0.01
+    let mut output_u8 = vec![0u8; nc * ns];
+
+    eprintln!("  [INT8] warmup...");
+    ei_i8[0].set_data(&mut input_u8);
+    ei_i8[1].set_data(&mut weight_u8);
+    eo_i8[0].set_data(&mut output_u8);
+    let int8_works = ctx_i8.execute(g_i8, &mut ei_i8, &mut eo_i8).is_ok();
+
+    let mut int8_median = 0.0;
+    if int8_works {
+        eprintln!("  [INT8] {} ops per encoder pass", ops_per_pass);
+        let mut i8_timings = Vec::with_capacity(runs);
+        for i in 0..runs {
+            let start = Instant::now();
+            for _ in 0..ops_per_pass {
+                ei_i8[0].set_data(&mut input_u8);
+                ei_i8[1].set_data(&mut weight_u8);
+                eo_i8[0].set_data(&mut output_u8);
+                ctx_i8.execute(g_i8, &mut ei_i8, &mut eo_i8).map_err(|e| format!("i8: {e}"))?;
+            }
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            i8_timings.push(ms);
+            eprintln!("  [INT8] run {}: {:.1}ms ({:.2}ms/op)", i + 1, ms, ms / ops_per_pass as f64);
+        }
+        i8_timings.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        int8_median = i8_timings[i8_timings.len() / 2];
+        eprintln!("  [INT8] vs [FP32]: {:.1}x speedup", fp32_median / int8_median);
+    } else {
+        eprintln!("  [INT8] execute failed — HTP may not support this quantization config");
     }
 
-    timings.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let label = if int8_works {
+        format!("NPU enc FP32+INT8")
+    } else {
+        format!("NPU enc FP32")
+    };
+    let text = if int8_works {
+        format!("FP32: {:.0}ms, INT8: {:.0}ms ({:.1}x), {} ops [{}×{}]",
+            fp32_median, int8_median, fp32_median / int8_median, ops_per_pass, nc, ns)
+    } else {
+        format!("FP32: {:.0}ms, {} ops [{}×{}]", fp32_median, ops_per_pass, nc, ns)
+    };
 
     Ok(BenchResult {
-        label: "NPU encoder (QNN HTP)".to_string(),
-        median_ms: timings[timings.len() / 2],
-        min_ms: timings[0],
-        max_ms: *timings.last().unwrap(),
-        text: format!("{} matmuls [{}×{}], real weights", ops_per_pass, nc, ns),
+        label,
+        median_ms: if int8_works { int8_median } else { fp32_median },
+        min_ms: if int8_works { int8_median } else { fp32_timings[0] },
+        max_ms: fp32_median,
+        text,
     })
 }
 
@@ -389,8 +458,8 @@ fn run_backend_subprocess(args: &Args, backend: &str) -> Result<BenchResult, Str
 fn run_subprocess(backend: &str, args: &Args) {
     let audio = load_audio(&args.audio);
     let result = match backend {
-        "gpu" => bench_whisper_cpp(&args.model, &audio, true, args.runs),
-        "cpu" => bench_whisper_cpp(&args.model, &audio, false, args.runs),
+        "gpu" => bench_whisper_cpp(&args.model, &audio, true, args.runs, &args.language),
+        "cpu" => bench_whisper_cpp(&args.model, &audio, false, args.runs, &args.language),
         _ => Err(format!("unknown subprocess backend: {backend}")),
     };
 
@@ -436,13 +505,14 @@ fn bench_hybrid(
     model_path: &Path,
     audio: &[f32],
     runs: usize,
+    lang: &str,
 ) -> Result<BenchResult, String> {
     use whisper_backend::ffi::*;
     use std::ffi::{CStr, CString};
 
     // Step 1: CPU reference
     let hw = any_stt::detect_hardware();
-    let engine = WhisperEngine::new(model_path, "en", Backend::Cpu, hw)
+    let engine = WhisperEngine::new(model_path, lang, Backend::Cpu, hw)
         .map_err(|e| format!("{e}"))?;
     let cpu_result = engine.transcribe(audio).map_err(|e| format!("{e}"))?;
     eprintln!("  CPU reference: \"{}\"", cpu_result.text.trim());
@@ -457,7 +527,7 @@ fn bench_hybrid(
         return Err("failed to load model".into());
     }
 
-    let lang = CString::new("en").unwrap();
+    let lang = CString::new(lang).unwrap();
     let n_threads = std::thread::available_parallelism()
         .map(|n| n.get() as i32).unwrap_or(4);
 
@@ -623,6 +693,7 @@ struct Args {
     runs: usize,
     backend: BackendArg,
     subprocess: Option<String>,
+    language: String,
 }
 
 #[derive(Debug, Clone)]
@@ -681,6 +752,7 @@ fn parse_args() -> Args {
     let mut runs = 3usize;
     let mut backend = BackendArg::Cpu;
     let mut subprocess: Option<String> = None;
+    let mut language = "en".to_string();
 
     let mut i = 1;
     while i < args.len() {
@@ -688,6 +760,7 @@ fn parse_args() -> Args {
             "--model" | "-m" => { i += 1; model = Some(PathBuf::from(&args[i])); }
             "--audio" | "-a" => { i += 1; audio = Some(PathBuf::from(&args[i])); }
             "--runs" | "-r" => { i += 1; runs = args[i].parse().expect("--runs must be a number"); }
+            "--lang" | "-l" => { i += 1; language = args[i].clone(); }
             "--backend" | "-b" => {
                 i += 1;
                 backend = match args[i].as_str() {
@@ -726,5 +799,5 @@ fn parse_args() -> Args {
         panic!("--audio not specified and no default found");
     });
 
-    Args { model, audio, runs, backend, subprocess }
+    Args { model, audio, runs, backend, subprocess, language }
 }

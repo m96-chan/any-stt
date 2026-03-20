@@ -47,7 +47,12 @@ pub const QNN_DATATYPE_BOOL_8: u32 = 0x0508;
 pub const QNN_DATATYPE_SFIXED_POINT_8: u32 = 0x0508;
 
 pub const QNN_DEFINITION_UNDEFINED: u32 = 0x7FFF_FFFF;
+pub const QNN_DEFINITION_DEFINED: u32 = 0;
 pub const QNN_QUANTIZATION_ENCODING_UNDEFINED: u32 = 0x7FFF_FFFF;
+pub const QNN_QUANTIZATION_ENCODING_SCALE_OFFSET: u32 = 0;
+
+pub const QNN_DATATYPE_UFIXED_POINT_8: u32 = 0x0408;
+pub const QNN_DATATYPE_UFIXED_POINT_16: u32 = 0x0416;
 
 pub const QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER: u32 = 0;
 pub const QNN_TENSORMEMTYPE_RAW: u32 = 0;
@@ -69,14 +74,25 @@ pub struct Qnn_QuantizeParams_t {
 
 impl Qnn_QuantizeParams_t {
     pub fn undefined() -> Self {
-        let q = Self {
+        Self {
             encoding_definition: QNN_DEFINITION_UNDEFINED,
             quantization_encoding: QNN_QUANTIZATION_ENCODING_UNDEFINED,
             _union: [0; 32],
+        }
+    }
+
+    /// Create scale-offset quantization parameters.
+    /// For UFIXED_POINT_8: real_value = (quantized_value - offset) * scale
+    pub fn scale_offset(scale: f32, offset: i32) -> Self {
+        let mut params = Self {
+            encoding_definition: QNN_DEFINITION_DEFINED,
+            quantization_encoding: QNN_QUANTIZATION_ENCODING_SCALE_OFFSET,
+            _union: [0; 32],
         };
-        // Set scaleOffsetEncoding = {scale: 0.0, offset: 0}
-        // scale at union[0..4], offset at union[4..8]
-        q
+        // scaleOffsetEncoding: scale (f32) at union[0..4], offset (i32) at union[4..8]
+        params._union[0..4].copy_from_slice(&scale.to_le_bytes());
+        params._union[4..8].copy_from_slice(&offset.to_le_bytes());
+        params
     }
 }
 
@@ -162,6 +178,34 @@ impl Qnn_Tensor_t {
     /// Use `set_data` to provide the weight data before registration.
     pub fn static_tensor(name: *const c_char, rank: u32, dimensions: *mut u32) -> Self {
         Self::new(name, QNN_TENSOR_TYPE_STATIC, rank, dimensions)
+    }
+
+    /// Create a quantized APP_WRITE tensor (UFIXED_POINT_8 with scale/offset).
+    pub fn app_write_quant_u8(
+        name: *const c_char,
+        rank: u32,
+        dimensions: *mut u32,
+        scale: f32,
+        offset: i32,
+    ) -> Self {
+        let mut t = Self::new(name, QNN_TENSOR_TYPE_APP_WRITE, rank, dimensions);
+        t.v1.data_type = QNN_DATATYPE_UFIXED_POINT_8;
+        t.v1.quant_params = Qnn_QuantizeParams_t::scale_offset(scale, offset);
+        t
+    }
+
+    /// Create a quantized APP_READ tensor (UFIXED_POINT_8 with scale/offset).
+    pub fn app_read_quant_u8(
+        name: *const c_char,
+        rank: u32,
+        dimensions: *mut u32,
+        scale: f32,
+        offset: i32,
+    ) -> Self {
+        let mut t = Self::new(name, QNN_TENSOR_TYPE_APP_READ, rank, dimensions);
+        t.v1.data_type = QNN_DATATYPE_UFIXED_POINT_8;
+        t.v1.quant_params = Qnn_QuantizeParams_t::scale_offset(scale, offset);
+        t
     }
 
     pub(crate) fn new(name: *const c_char, tensor_type: u32, rank: u32, dimensions: *mut u32) -> Self {
