@@ -556,6 +556,17 @@ impl WhisperEncoderGraph {
     pub fn config(&self) -> &EncoderConfig {
         &self.config
     }
+
+    /// Save the compiled encoder context to a cache file.
+    pub fn save_cache(&self, cache_dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        let path = crate::context::QnnContext::cache_path(
+            cache_dir, "whisper", self.config.n_layer, self.config.n_state,
+        );
+        std::fs::create_dir_all(cache_dir)
+            .map_err(|e| format!("mkdir {}: {e}", cache_dir.display()))?;
+        self.ctx.save_binary(&path)?;
+        Ok(path)
+    }
 }
 
 /// Extension trait for Qnn_Tensor_t to clone the descriptor.

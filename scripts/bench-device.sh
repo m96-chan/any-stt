@@ -116,7 +116,14 @@ if [[ -n "$BUILD_LIB_DIR" && -d "$BUILD_LIB_DIR" ]]; then
     echo "Pushing shared libraries from $BUILD_LIB_DIR..."
     for so in "$BUILD_LIB_DIR"/*.so; do
         if [[ -f "$so" ]]; then
-            echo "  $(basename "$so")"
+            soname=$(basename "$so")
+            # Skip Vulkan .so unless --vulkan flag is set (prevents ggml auto-detection
+            # which causes 3.6x CPU slowdown on Adreno devices)
+            if [[ "$soname" == "libggml-vulkan.so" && -z "$FEATURES" ]]; then
+                echo "  $soname (SKIPPED — use --vulkan to include)"
+                continue
+            fi
+            echo "  $soname"
             $ADB push "$so" "$DEVICE_DIR/"
         fi
     done

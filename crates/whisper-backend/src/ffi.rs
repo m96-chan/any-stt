@@ -178,7 +178,15 @@ extern "C" {
 
     // --- Encoder output injection (for hybrid NPU+CPU pipeline) ---
 
+    /// Get conv output (encoder input after mel→conv→gelu→pos_embed).
+    pub fn whisper_get_conv_output(
+        ctx: *mut WhisperContext,
+        n_ctx: *mut c_int,
+        n_state: *mut c_int,
+    ) -> *mut c_float;
+
     /// Enable/disable encoder skip mode for decode-only execution.
+    /// When enabled, conv still runs but encoder blocks are skipped.
     pub fn whisper_set_skip_encode(ctx: *mut WhisperContext, skip: bool);
 
     /// Get pointer to internal encoder output tensor data.
