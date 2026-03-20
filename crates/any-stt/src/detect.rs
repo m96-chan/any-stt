@@ -95,20 +95,22 @@ fn detect_cpu_cores() -> u32 {
 }
 
 fn detect_gpu() -> Option<GpuInfo> {
-    // Linux: try parsing nvidia-smi for NVIDIA GPUs.
+    // Linux: enumerate GPUs via /sys/class/drm, then probe details.
     #[cfg(target_os = "linux")]
     {
+        // First try nvidia-smi for NVIDIA (gives VRAM + driver info)
         if let Some(gpu) = detect_nvidia_gpu() {
+            return Some(gpu);
+        }
+        // Fall back to sysfs for AMD/Intel/other
+        if let Some(gpu) = detect_gpu_sysfs() {
             return Some(gpu);
         }
     }
 
-    // Android: check for Qualcomm/Mali/etc via /proc
+    // Android: GPU detection via Vulkan probing (done at runtime)
     #[cfg(target_os = "android")]
-    {
-        // GPU detection on Android is limited without Vulkan probing.
-        // Return None here; Vulkan-based detection is done separately.
-    }
+    {}
 
     // Apple (macOS/iOS): Apple GPU is always present on Apple Silicon.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -116,13 +118,99 @@ fn detect_gpu() -> Option<GpuInfo> {
         return Some(GpuInfo {
             vendor: GpuVendor::Apple,
             name: "Apple GPU".into(),
-            vram_mb: 0, // Unified memory — reported via available_ram_mb instead.
+            vram_mb: 0,
             driver: String::new(),
         });
     }
 
     #[allow(unreachable_code)]
     None
+}
+
+/// Detect GPU via /sys/class/drm PCI vendor IDs.
+/// Works for AMD, Intel, and NVIDIA (as fallback if nvidia-smi is missing).
+#[cfg(target_os = "linux")]
+fn detect_gpu_sysfs() -> Option<GpuInfo> {
+    // PCI vendor IDs
+    const VENDOR_NVIDIA: &str = "0x10de";
+    const VENDOR_AMD: &str = "0x1002";
+    const VENDOR_INTEL: &str = "0x8086";
+
+    let drm_dir = std::path::Path::new("/sys/class/drm");
+    if !drm_dir.exists() {
+        return None;
+    }
+
+    let entries = std::fs::read_dir(drm_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Only look at cardN (not cardN-DP-1 etc.)
+        if !name_str.starts_with("card") || name_str.contains('-') {
+            continue;
+        }
+
+        let vendor_path = entry.path().join("device/vendor");
+        let vendor = std::fs::read_to_string(&vendor_path)
+            .ok()
+            .map(|s| s.trim().to_lowercase());
+
+        let driver_path = entry.path().join("device/uevent");
+        let driver = std::fs::read_to_string(&driver_path)
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("DRIVER="))
+                    .map(|l| l.trim_start_matches("DRIVER=").to_string())
+            })
+            .unwrap_or_default();
+
+        if let Some(ref v) = vendor {
+            let (gpu_vendor, gpu_name) = match v.as_str() {
+                VENDOR_AMD => (GpuVendor::Amd, format!("AMD GPU ({})", driver)),
+                VENDOR_INTEL => (GpuVendor::Intel, format!("Intel GPU ({})", driver)),
+                VENDOR_NVIDIA => (GpuVendor::Nvidia, format!("NVIDIA GPU ({})", driver)),
+                _ => continue,
+            };
+
+            // Try to get VRAM from /sys (AMD exposes this)
+            let vram_mb = entry
+                .path()
+                .join("device/mem_info_vram_total")
+                .pipe(|p| std::fs::read_to_string(p).ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|b| b / (1024 * 1024))
+                .unwrap_or(0);
+
+            return Some(GpuInfo {
+                vendor: gpu_vendor,
+                name: gpu_name,
+                vram_mb,
+                driver,
+            });
+        }
+    }
+
+    None
+}
+
+/// Helper: allow chaining on Path (for VRAM read)
+#[cfg(target_os = "linux")]
+trait PathPipe {
+    fn pipe<F, R>(self, f: F) -> R
+    where
+        F: FnOnce(Self) -> R,
+        Self: Sized;
+}
+
+#[cfg(target_os = "linux")]
+impl PathPipe for std::path::PathBuf {
+    fn pipe<F, R>(self, f: F) -> R
+    where
+        F: FnOnce(Self) -> R,
+    {
+        f(self)
+    }
 }
 
 /// Try to detect NVIDIA GPU by running nvidia-smi.
