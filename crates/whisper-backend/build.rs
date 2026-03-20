@@ -19,6 +19,7 @@ fn main() {
     let use_vulkan = env::var("CARGO_FEATURE_VULKAN").is_ok();
     let use_metal = env::var("CARGO_FEATURE_METAL").is_ok() || is_ios;
     let use_coreml = env::var("CARGO_FEATURE_COREML").is_ok();
+    let use_cuda = env::var("CARGO_FEATURE_CUDA").is_ok();
 
     // --- Step 1: Configure cmake ---
 
@@ -32,7 +33,7 @@ fn main() {
         .define("WHISPER_CURL", "OFF")
         .define("WHISPER_SDL2", "OFF")
         .define("GGML_NATIVE", if is_cross { "OFF" } else { "ON" })
-        .define("GGML_CUDA", "OFF")
+        .define("GGML_CUDA", if use_cuda { "ON" } else { "OFF" })
         .define("GGML_OPENCL", "OFF")
         .define("GGML_SYCL", "OFF")
         .define("GGML_RPC", "OFF");
@@ -144,6 +145,26 @@ fn main() {
         if use_coreml {
             println!("cargo:rustc-link-lib=static=whisper.coreml");
             println!("cargo:rustc-link-lib=framework=CoreML");
+        }
+
+        // CUDA
+        if use_cuda {
+            println!("cargo:rustc-link-lib=static=ggml-cuda");
+            // CUDA runtime + driver libraries
+            println!("cargo:rustc-link-lib=cudart");
+            println!("cargo:rustc-link-lib=cublas");
+            println!("cargo:rustc-link-lib=cublasLt");
+            println!("cargo:rustc-link-lib=cuda"); // driver API (cuMemAddressFree etc.)
+            // CUDA lib paths
+            if let Ok(cuda_home) = env::var("CUDA_HOME") {
+                println!("cargo:rustc-link-search=native={cuda_home}/lib64");
+            } else {
+                println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
+                println!("cargo:rustc-link-search=native=/opt/cuda/lib64");
+            }
+            // NVIDIA driver stub (for libcuda.so)
+            println!("cargo:rustc-link-search=native=/usr/lib64");
+            println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
         }
 
         // Vulkan

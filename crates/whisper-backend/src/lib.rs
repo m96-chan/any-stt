@@ -243,7 +243,23 @@ pub fn initialize(config: &any_stt::SttConfig) -> Result<Box<dyn SttEngine>, Stt
             }
         }
 
-        // Other backends pass through
+        // CUDA / Vulkan: whisper.cpp handles via use_gpu flag
+        Backend::Cuda | Backend::Vulkan => {
+            let engine = WhisperEngine::new(
+                model_path, &config.language, selection.backend, hw.clone(),
+            );
+            match engine {
+                Ok(e) => {
+                    eprintln!("initialize: using {:?} backend", selection.backend);
+                    return Ok(Box::new(e));
+                }
+                Err(e) => {
+                    eprintln!("initialize: {:?} failed ({e}), falling back to CPU",
+                        selection.backend);
+                }
+            }
+        }
+
         _ => {}
     }
 

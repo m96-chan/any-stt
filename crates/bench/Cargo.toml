@@ -18,3 +18,4 @@ hound = "3"
 vulkan = ["whisper-backend/vulkan"]
 metal = ["whisper-backend/metal"]
 coreml = ["whisper-backend/coreml"]
+cuda = ["whisper-backend/cuda"]
