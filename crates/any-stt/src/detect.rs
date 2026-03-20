@@ -4,10 +4,13 @@ use crate::hardware::{CpuFeature, CpuInfo, HardwareInfo, NpuInfo, OsInfo, Platfo
 use crate::hardware::{GpuInfo, GpuVendor, NpuType};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use crate::hardware::{GpuInfo, GpuVendor};
+use crate::hardware::GpuInfo;
+
+#[cfg(target_os = "linux")]
+use crate::hardware::GpuVendor;
 
 #[cfg(target_os = "android")]
-use crate::hardware::NpuType;
+use crate::hardware::{GpuVendor, NpuType};
 
 /// Detect hardware capabilities of the current system.
 pub fn detect_hardware() -> HardwareInfo {
@@ -100,8 +103,15 @@ fn detect_gpu() -> Option<GpuInfo> {
         }
     }
 
-    // macOS: Apple GPU is always present on Apple Silicon.
-    #[cfg(target_os = "macos")]
+    // Android: check for Qualcomm/Mali/etc via /proc
+    #[cfg(target_os = "android")]
+    {
+        // GPU detection on Android is limited without Vulkan probing.
+        // Return None here; Vulkan-based detection is done separately.
+    }
+
+    // Apple (macOS/iOS): Apple GPU is always present on Apple Silicon.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         return Some(GpuInfo {
             vendor: GpuVendor::Apple,
@@ -216,7 +226,7 @@ fn detect_os_version() -> String {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         if let Ok(output) = std::process::Command::new("sw_vers")
             .arg("-productVersion")
@@ -239,9 +249,9 @@ fn detect_available_ram_mb() -> u64 {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
-        if let Some(ram) = detect_available_ram_macos() {
+        if let Some(ram) = detect_available_ram_apple() {
             return ram;
         }
     }
@@ -261,8 +271,9 @@ fn detect_available_ram_linux() -> Option<u64> {
     None
 }
 
-#[cfg(target_os = "macos")]
-fn detect_available_ram_macos() -> Option<u64> {
+/// Detect available RAM on Apple platforms (macOS/iOS) via sysctl.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn detect_available_ram_apple() -> Option<u64> {
     let output = std::process::Command::new("sysctl")
         .arg("-n")
         .arg("hw.memsize")

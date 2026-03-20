@@ -367,4 +367,63 @@ mod tests {
         let sel = select(&config, &hw);
         assert_eq!(sel.backend, Backend::Vulkan);
     }
+
+    // --- iOS/macOS tests ---
+
+    fn apple_gpu() -> GpuInfo {
+        GpuInfo {
+            vendor: GpuVendor::Apple,
+            name: "Apple GPU".into(),
+            vram_mb: 0,
+            driver: String::new(),
+        }
+    }
+
+    #[test]
+    fn ios_with_coreml_selects_coreml() {
+        let hw = make_hw(
+            Platform::Ios,
+            Some(apple_gpu()),
+            Some(NpuInfo { npu_type: NpuType::CoreMl, available: true }),
+            6000,
+        );
+        let sel = select(&SttConfig::default(), &hw);
+        assert_eq!(sel.backend, Backend::CoreMl);
+    }
+
+    #[test]
+    fn ios_coreml_unavailable_selects_metal() {
+        let hw = make_hw(
+            Platform::Ios,
+            Some(apple_gpu()),
+            Some(NpuInfo { npu_type: NpuType::CoreMl, available: false }),
+            6000,
+        );
+        let sel = select(&SttConfig::default(), &hw);
+        assert_eq!(sel.backend, Backend::Metal);
+    }
+
+    #[test]
+    fn ios_without_npu_selects_metal() {
+        let hw = make_hw(
+            Platform::Ios,
+            Some(apple_gpu()),
+            None,
+            6000,
+        );
+        let sel = select(&SttConfig::default(), &hw);
+        assert_eq!(sel.backend, Backend::Metal);
+    }
+
+    #[test]
+    fn macos_with_coreml_selects_coreml() {
+        let hw = make_hw(
+            Platform::MacOs,
+            Some(apple_gpu()),
+            Some(NpuInfo { npu_type: NpuType::CoreMl, available: true }),
+            16000,
+        );
+        let sel = select(&SttConfig::default(), &hw);
+        assert_eq!(sel.backend, Backend::CoreMl);
+    }
 }

@@ -183,8 +183,12 @@ impl SttEngine for WhisperEngine {
 
 /// Initialize the best available STT engine with automatic fallback.
 ///
-/// Tries QNN NPU (Snapdragon) → CPU, returning the first working engine.
-/// Never fails due to NPU unavailability — always falls back to CPU.
+/// Backend selection priority:
+/// - iOS/macOS: CoreML (ANE) → Metal (GPU) → CPU
+/// - Android (Snapdragon): QNN HTP (NPU) → CPU
+/// - Linux: CUDA → CPU
+///
+/// Never fails due to accelerator unavailability — always falls back to CPU.
 ///
 /// # Errors
 /// - `SttError::ModelNotFound` if `config.model_path` doesn't exist
@@ -201,24 +205,50 @@ pub fn initialize(config: &any_stt::SttConfig) -> Result<Box<dyn SttEngine>, Stt
     }
 
     let hw = any_stt::detect_hardware();
+    let selection = any_stt::selector::select(config, &hw);
 
-    // Try hybrid engine (auto-detects NPU, falls back to CPU internally)
-    match hybrid::WhisperQnnEngine::new(model_path, &config.language, hw.clone()) {
-        Ok(engine) => {
-            eprintln!("initialize: using {} backend", match engine.active_backend() {
-                Backend::Qnn => "QNN NPU",
-                _ => "CPU",
-            });
-            return Ok(Box::new(engine));
+    eprintln!("initialize: selected backend={:?}, quantization={:?}",
+        selection.backend, selection.quantization);
+
+    match selection.backend {
+        // Apple platforms: CoreML (ANE) or Metal (GPU)
+        // whisper.cpp handles these internally when compiled with WHISPER_COREML / GGML_METAL
+        Backend::CoreMl | Backend::Metal => {
+            let engine = WhisperEngine::new(
+                model_path, &config.language, selection.backend, hw.clone(),
+            );
+            match engine {
+                Ok(e) => {
+                    eprintln!("initialize: using {:?} backend", selection.backend);
+                    return Ok(Box::new(e));
+                }
+                Err(e) => {
+                    eprintln!("initialize: {:?} failed ({e}), falling back to CPU",
+                        selection.backend);
+                }
+            }
         }
-        Err(e) => {
-            eprintln!("initialize: hybrid engine failed ({e}), trying CPU-only");
+
+        // Snapdragon: QNN HTP (NPU) with CPU fallback
+        Backend::Qnn => {
+            match hybrid::WhisperQnnEngine::new(model_path, &config.language, hw.clone()) {
+                Ok(engine) => {
+                    eprintln!("initialize: using {} backend",
+                        if engine.active_backend() == Backend::Qnn { "QNN NPU" } else { "CPU (QNN unavailable)" });
+                    return Ok(Box::new(engine));
+                }
+                Err(e) => {
+                    eprintln!("initialize: hybrid engine failed ({e}), falling back to CPU");
+                }
+            }
         }
+
+        // Other backends pass through
+        _ => {}
     }
 
-    // Fallback: pure CPU whisper.cpp
-    let backend = config.backend.unwrap_or(Backend::Cpu);
-    let engine = WhisperEngine::new(model_path, &config.language, backend, hw)?;
+    // Final fallback: CPU-only whisper.cpp
+    let engine = WhisperEngine::new(model_path, &config.language, Backend::Cpu, hw)?;
     eprintln!("initialize: using CPU backend");
     Ok(Box::new(engine))
 }

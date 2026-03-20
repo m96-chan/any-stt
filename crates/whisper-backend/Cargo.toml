@@ -16,6 +16,8 @@ serde_json = "1"
 
 [features]
 vulkan = []
+metal = []
+coreml = []
 
 [build-dependencies]
 cmake = "0.1"

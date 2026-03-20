@@ -16,3 +16,5 @@ hound = "3"
 
 [features]
 vulkan = ["whisper-backend/vulkan"]
+metal = ["whisper-backend/metal"]
+coreml = ["whisper-backend/coreml"]
