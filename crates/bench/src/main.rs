@@ -430,6 +430,8 @@ fn guess_weight_size(name: &str, n_state: usize, _n_layer: u32) -> usize {
 
 /// Hybrid benchmark: CPU encode → extract encoder output → re-inject → decode-only.
 /// Validates that encoder output injection produces identical transcription.
+/// Hybrid benchmark: CPU encode once → save encoder output → skip_encode + inject → decode-only.
+/// Measures decode-only time (simulating NPU encoder replacing CPU encoder).
 fn bench_hybrid(
     model_path: &Path,
     audio: &[f32],
@@ -438,31 +440,29 @@ fn bench_hybrid(
     use whisper_backend::ffi::*;
     use std::ffi::{CStr, CString};
 
+    // Step 1: CPU reference
     let hw = any_stt::detect_hardware();
     let engine = WhisperEngine::new(model_path, "en", Backend::Cpu, hw)
         .map_err(|e| format!("{e}"))?;
-
-    // Step 1: Run full CPU transcription to get reference text
     let cpu_result = engine.transcribe(audio).map_err(|e| format!("{e}"))?;
     eprintln!("  CPU reference: \"{}\"", cpu_result.text.trim());
+    drop(engine);
 
-    // Step 2: Create a second context for hybrid decode
+    // Step 2: Create context and run one full pass to initialize state + get encoder output
     let path_cstr = CString::new(model_path.to_str().unwrap()).unwrap();
     let mut cparams = unsafe { whisper_context_default_params() };
     cparams.use_gpu = false;
     let ctx = unsafe { whisper_init_from_file_with_params(path_cstr.as_ptr(), cparams) };
     if ctx.is_null() {
-        return Err("failed to load model for hybrid".into());
+        return Err("failed to load model".into());
     }
 
-    // Step 3: Run encode on the hybrid context to allocate state
-    // We need to call whisper_full once to initialize state, then we'll overwrite embd_enc
     let lang = CString::new("en").unwrap();
     let n_threads = std::thread::available_parallelism()
         .map(|n| n.get() as i32).unwrap_or(4);
 
-    // First, run full CPU inference on this context to get reference encoder output
-    {
+    // Helper to create configured params
+    let make_params = || -> *mut WhisperFullParams {
         let params = unsafe { shim_default_params(WhisperSamplingStrategy::Greedy) };
         unsafe {
             shim_params_set_language(params, lang.as_ptr());
@@ -474,12 +474,16 @@ fn bench_hybrid(
             shim_params_set_print_timestamps(params, false);
             shim_params_set_single_segment(params, false);
             shim_params_set_suppress_nst(params, true);
-            shim_whisper_full(ctx, params, audio.as_ptr(), audio.len() as i32);
-            shim_free_params(params);
         }
-    }
+        params
+    };
 
-    // Get encoder output
+    // Run full CPU inference to init state and get encoder output
+    let params = make_params();
+    unsafe { shim_whisper_full(ctx, params, audio.as_ptr(), audio.len() as i32) };
+    unsafe { shim_free_params(params) };
+
+    // Save encoder output
     let mut enc_n_ctx: i32 = 0;
     let mut enc_n_state: i32 = 0;
     let enc_ptr = unsafe { whisper_get_encoder_output(ctx, &mut enc_n_ctx, &mut enc_n_state) };
@@ -487,44 +491,18 @@ fn bench_hybrid(
         unsafe { whisper_free(ctx) };
         return Err("whisper_get_encoder_output returned null".into());
     }
-    eprintln!("  encoder output: [{enc_n_ctx}, {enc_n_state}]");
-
-    // Copy encoder output
     let enc_size = (enc_n_ctx as usize) * (enc_n_state as usize);
     let enc_data: Vec<f32> = unsafe {
         std::slice::from_raw_parts(enc_ptr, enc_size).to_vec()
     };
+    eprintln!("  encoder output: [{enc_n_ctx}, {enc_n_state}] ({} floats)", enc_size);
 
-    // Step 4: Benchmark: inject encoder output + decode
-    eprintln!("  warmup (inject + decode)...");
-    // Warmup: run full inference, then overwrite encoder output, then decode again
+    // Step 3: Benchmark decode-only — inject encoder output, skip encode
+    eprintln!("  warmup (skip_encode + decode-only)...");
     {
-        let params = unsafe { shim_default_params(WhisperSamplingStrategy::Greedy) };
-        unsafe {
-            shim_params_set_language(params, lang.as_ptr());
-            shim_params_set_n_threads(params, n_threads);
-            shim_params_set_translate(params, false);
-            shim_params_set_print_special(params, false);
-            shim_params_set_print_progress(params, false);
-            shim_params_set_print_realtime(params, false);
-            shim_params_set_print_timestamps(params, false);
-            shim_params_set_single_segment(params, false);
-            shim_params_set_suppress_nst(params, true);
-        }
-
-        // Run full (to re-initialize state), then inject and decode again
-        unsafe { shim_whisper_full(ctx, params, audio.as_ptr(), audio.len() as i32) };
-
-        // Inject saved encoder output
-        let ret = unsafe {
-            whisper_set_encoder_output(ctx, enc_data.as_ptr(), enc_n_ctx, enc_n_state)
-        };
-        if ret != 0 {
-            unsafe { shim_free_params(params); whisper_free(ctx) };
-            return Err("whisper_set_encoder_output failed".into());
-        }
-
-        // Run full again — encoder will re-run but we immediately overwrite its output
+        unsafe { whisper_set_encoder_output(ctx, enc_data.as_ptr(), enc_n_ctx, enc_n_state) };
+        unsafe { whisper_set_skip_encode(ctx, true) };
+        let params = make_params();
         unsafe { shim_whisper_full(ctx, params, audio.as_ptr(), audio.len() as i32) };
         unsafe { shim_free_params(params) };
     }
@@ -533,37 +511,19 @@ fn bench_hybrid(
     let mut last_text = String::new();
 
     for i in 0..runs {
-        let params = unsafe { shim_default_params(WhisperSamplingStrategy::Greedy) };
-        unsafe {
-            shim_params_set_language(params, lang.as_ptr());
-            shim_params_set_n_threads(params, n_threads);
-            shim_params_set_translate(params, false);
-            shim_params_set_print_special(params, false);
-            shim_params_set_print_progress(params, false);
-            shim_params_set_print_realtime(params, false);
-            shim_params_set_print_timestamps(params, false);
-            shim_params_set_single_segment(params, false);
-            shim_params_set_suppress_nst(params, true);
-        }
-
-        let start = Instant::now();
-
-        // Full inference (includes encode + decode)
-        let ret = unsafe { shim_whisper_full(ctx, params, audio.as_ptr(), audio.len() as i32) };
-
-        // Inject external encoder output (overwriting what whisper just computed)
+        // Inject encoder output + enable skip
         unsafe { whisper_set_encoder_output(ctx, enc_data.as_ptr(), enc_n_ctx, enc_n_state) };
+        unsafe { whisper_set_skip_encode(ctx, true) };
 
-        // Run again — this time the encoder output is our injected data
-        // and the decoder will use it for cross-attention
-        let ret2 = unsafe { shim_whisper_full(ctx, params, audio.as_ptr(), audio.len() as i32) };
-
+        let params = make_params();
+        let start = Instant::now();
+        let ret = unsafe { shim_whisper_full(ctx, params, audio.as_ptr(), audio.len() as i32) };
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         unsafe { shim_free_params(params) };
 
-        if ret != 0 || ret2 != 0 {
+        if ret != 0 {
             unsafe { whisper_free(ctx) };
-            return Err(format!("whisper_full failed: {ret}/{ret2}"));
+            return Err(format!("whisper_full(decode-only) failed: {ret}"));
         }
 
         // Collect output text
@@ -586,25 +546,20 @@ fn bench_hybrid(
     }
 
     unsafe { whisper_free(ctx) };
-
     timings.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     // Verify output matches CPU reference
-    let cpu_trimmed = cpu_result.text.trim();
-    let hybrid_trimmed = last_text.trim();
-    let match_status = if cpu_trimmed == hybrid_trimmed {
-        "MATCH"
-    } else {
-        "MISMATCH"
-    };
-    eprintln!("  → output {match_status} vs CPU reference");
-    if cpu_trimmed != hybrid_trimmed {
-        eprintln!("    CPU:    \"{}\"", cpu_trimmed);
-        eprintln!("    Hybrid: \"{}\"", hybrid_trimmed);
+    let cpu_t = cpu_result.text.trim();
+    let hyb_t = last_text.trim();
+    let status = if cpu_t == hyb_t { "MATCH" } else { "MISMATCH" };
+    eprintln!("  → output {status} vs CPU reference");
+    if cpu_t != hyb_t {
+        eprintln!("    CPU:    \"{}\"", cpu_t);
+        eprintln!("    Hybrid: \"{}\"", hyb_t);
     }
 
     Ok(BenchResult {
-        label: "Hybrid (inject+decode)".to_string(),
+        label: "Hybrid decode-only".to_string(),
         median_ms: timings[timings.len() / 2],
         min_ms: timings[0],
         max_ms: *timings.last().unwrap(),

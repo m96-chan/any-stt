@@ -178,6 +178,9 @@ extern "C" {
 
     // --- Encoder output injection (for hybrid NPU+CPU pipeline) ---
 
+    /// Enable/disable encoder skip mode for decode-only execution.
+    pub fn whisper_set_skip_encode(ctx: *mut WhisperContext, skip: bool);
+
     /// Get pointer to internal encoder output tensor data.
     /// Returns null if encoder hasn't been run yet.
     pub fn whisper_get_encoder_output(
