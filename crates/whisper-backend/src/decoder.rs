@@ -4,7 +4,7 @@
 //! Multiple implementations allow backend swapping (CPU via whisper.cpp,
 //! future: pure Rust, NPU decoder).
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::path::Path;
 use std::time::Instant;
 
@@ -13,6 +13,7 @@ use any_stt::error::SttError;
 use any_stt::SttResult;
 
 use crate::ffi::*;
+use crate::helpers;
 
 /// Backend-swappable decoder trait.
 ///
@@ -53,16 +54,7 @@ impl WhisperCppDecoder {
     ///
     /// The model must match the encoder (same architecture/size).
     pub fn new(model_path: &Path, n_threads: i32) -> Result<Self, SttError> {
-        let path_cstr = CString::new(
-            model_path
-                .to_str()
-                .ok_or_else(|| SttError::ModelNotFound {
-                    path: model_path.to_path_buf(),
-                })?,
-        )
-        .map_err(|_| SttError::ModelNotFound {
-            path: model_path.to_path_buf(),
-        })?;
+        let path_cstr = helpers::model_path_to_cstring(model_path)?;
 
         let mut cparams = unsafe { whisper_context_default_params() };
         cparams.use_gpu = false; // decoder runs on CPU
@@ -104,65 +96,9 @@ impl WhisperCppDecoder {
         let lang = CString::new(language)
             .map_err(|_| SttError::TranscriptionFailed("invalid language".into()))?;
 
-        let params = unsafe { shim_default_params(WhisperSamplingStrategy::Greedy) };
-        if params.is_null() {
-            return Err(SttError::TranscriptionFailed("failed to alloc params".into()));
-        }
-
-        unsafe {
-            shim_params_set_language(params, lang.as_ptr());
-            shim_params_set_n_threads(params, self.n_threads);
-            shim_params_set_translate(params, false);
-            shim_params_set_print_special(params, false);
-            shim_params_set_print_progress(params, false);
-            shim_params_set_print_realtime(params, false);
-            shim_params_set_print_timestamps(params, false);
-            shim_params_set_single_segment(params, false);
-            shim_params_set_suppress_nst(params, true);
-        }
-
-        let ret = unsafe {
-            shim_whisper_full(self.ctx, params, audio.as_ptr(), audio.len() as i32)
-        };
-        unsafe { shim_free_params(params) };
-
-        if ret != 0 {
-            return Err(SttError::TranscriptionFailed(format!(
-                "whisper_full error {ret}"
-            )));
-        }
-
-        self.collect_result(start, language)
-    }
-
-    /// Collect transcription segments from the whisper context.
-    fn collect_result(&self, start: Instant, fallback_lang: &str) -> Result<SttResult, SttError> {
-        let n_segments = unsafe { whisper_full_n_segments(self.ctx) };
-        let mut text = String::new();
-        for i in 0..n_segments {
-            let segment_text = unsafe { whisper_full_get_segment_text(self.ctx, i) };
-            if !segment_text.is_null() {
-                let s = unsafe { CStr::from_ptr(segment_text) };
-                text.push_str(&s.to_string_lossy());
-            }
-        }
-
-        let lang_id = unsafe { whisper_full_lang_id(self.ctx) };
-        let lang_str = unsafe { whisper_lang_str(lang_id) };
-        let language = if !lang_str.is_null() {
-            unsafe { CStr::from_ptr(lang_str) }
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            fallback_lang.to_string()
-        };
-
-        Ok(SttResult {
-            text,
-            language,
-            duration_ms: start.elapsed().as_secs_f64() * 1000.0,
-            backend_used: Backend::Cpu,
-        })
+        let params = helpers::create_params(&lang, self.n_threads)?;
+        helpers::run_whisper_full(self.ctx, params, audio)?;
+        Ok(helpers::collect_result(self.ctx, start, language, Backend::Cpu))
     }
 }
 

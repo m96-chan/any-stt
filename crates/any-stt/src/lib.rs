@@ -90,9 +90,6 @@ mod tests {
     #[test]
     fn initialize_returns_error() {
         let result = initialize(SttConfig::default());
-        // initialize() should return an error since no real backend is wired up yet.
-        // The specific error depends on detected hardware (NotImplemented for CPU,
-        // BackendUnavailable for GPU backends).
         assert!(result.is_err(), "expected error, got Ok");
     }
 
@@ -114,5 +111,88 @@ mod tests {
         let m = Model::Custom("kotoba-tech/kotoba-whisper-v2.0".into());
         assert_eq!(m, Model::Custom("kotoba-tech/kotoba-whisper-v2.0".into()));
         assert_ne!(m, Model::KotobaV2);
+    }
+
+    // --- Display impls ---
+
+    #[test]
+    fn backend_display() {
+        assert_eq!(Backend::Cuda.to_string(), "CUDA");
+        assert_eq!(Backend::Metal.to_string(), "Metal");
+        assert_eq!(Backend::CoreMl.to_string(), "CoreML");
+        assert_eq!(Backend::Vulkan.to_string(), "Vulkan");
+        assert_eq!(Backend::Nnapi.to_string(), "NNAPI");
+        assert_eq!(Backend::Qnn.to_string(), "QNN");
+        assert_eq!(Backend::Cpu.to_string(), "CPU");
+    }
+
+    #[test]
+    fn model_display() {
+        assert_eq!(Model::Tiny.to_string(), "tiny");
+        assert_eq!(Model::TinyEn.to_string(), "tiny.en");
+        assert_eq!(Model::LargeV3Turbo.to_string(), "large-v3-turbo");
+        assert_eq!(Model::KotobaV2.to_string(), "kotoba-v2");
+        assert_eq!(
+            Model::Custom("my-model".into()).to_string(),
+            "custom(my-model)"
+        );
+    }
+
+    #[test]
+    fn quantization_display() {
+        assert_eq!(Quantization::F16.to_string(), "f16");
+        assert_eq!(Quantization::Q8_0.to_string(), "q8_0");
+        assert_eq!(Quantization::Q4_0.to_string(), "q4_0");
+    }
+
+    // --- SttResult ---
+
+    #[test]
+    fn stt_result_construction() {
+        let r = SttResult {
+            text: "hello world".into(),
+            language: "en".into(),
+            duration_ms: 42.5,
+            backend_used: Backend::Cpu,
+        };
+        assert_eq!(r.text, "hello world");
+        assert_eq!(r.language, "en");
+        assert!((r.duration_ms - 42.5).abs() < f64::EPSILON);
+        assert_eq!(r.backend_used, Backend::Cpu);
+    }
+
+    #[test]
+    fn stt_result_clone() {
+        let r = SttResult {
+            text: "test".into(),
+            language: "ja".into(),
+            duration_ms: 100.0,
+            backend_used: Backend::Qnn,
+        };
+        let r2 = r.clone();
+        assert_eq!(r.text, r2.text);
+        assert_eq!(r.backend_used, r2.backend_used);
+    }
+
+    // --- Config ---
+
+    #[test]
+    fn config_with_overrides() {
+        let config = SttConfig {
+            language: "ja".into(),
+            model: Model::LargeV3,
+            model_path: Some("/tmp/model.gguf".into()),
+            quantization: Some(Quantization::Q8_0),
+            backend: Some(Backend::Cuda),
+            sample_rate: 48000,
+            allow_cold_vulkan: true,
+        };
+        assert_eq!(config.language, "ja");
+        assert_eq!(config.model, Model::LargeV3);
+        assert!(config.model_path.is_some());
+        assert_eq!(config.quantization, Some(Quantization::Q8_0));
+        assert_eq!(config.backend, Some(Backend::Cuda));
+        assert_eq!(config.sample_rate, 48000);
+        assert!(config.allow_cold_vulkan);
     }
 }

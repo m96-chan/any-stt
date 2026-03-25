@@ -80,3 +80,56 @@ pub enum Backend {
     Qnn,
     Cpu,
 }
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cuda => write!(f, "CUDA"),
+            Self::Metal => write!(f, "Metal"),
+            Self::CoreMl => write!(f, "CoreML"),
+            Self::Vulkan => write!(f, "Vulkan"),
+            Self::Nnapi => write!(f, "NNAPI"),
+            Self::Qnn => write!(f, "QNN"),
+            Self::Cpu => write!(f, "CPU"),
+        }
+    }
+}
+
+impl std::fmt::Display for Model {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tiny => write!(f, "tiny"),
+            Self::TinyEn => write!(f, "tiny.en"),
+            Self::Base => write!(f, "base"),
+            Self::BaseEn => write!(f, "base.en"),
+            Self::Small => write!(f, "small"),
+            Self::SmallEn => write!(f, "small.en"),
+            Self::Medium => write!(f, "medium"),
+            Self::MediumEn => write!(f, "medium.en"),
+            Self::LargeV1 => write!(f, "large-v1"),
+            Self::LargeV2 => write!(f, "large-v2"),
+            Self::LargeV3 => write!(f, "large-v3"),
+            Self::LargeV3Turbo => write!(f, "large-v3-turbo"),
+            Self::DistilLargeV2 => write!(f, "distil-large-v2"),
+            Self::DistilLargeV3 => write!(f, "distil-large-v3"),
+            Self::DistilMediumEn => write!(f, "distil-medium.en"),
+            Self::DistilSmallEn => write!(f, "distil-small.en"),
+            Self::KotobaV1 => write!(f, "kotoba-v1"),
+            Self::KotobaV2 => write!(f, "kotoba-v2"),
+            Self::Custom(id) => write!(f, "custom({id})"),
+        }
+    }
+}
+
+impl std::fmt::Display for Quantization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::F16 => write!(f, "f16"),
+            Self::Q8_0 => write!(f, "q8_0"),
+            Self::Q5_1 => write!(f, "q5_1"),
+            Self::Q5_0 => write!(f, "q5_0"),
+            Self::Q4_1 => write!(f, "q4_1"),
+            Self::Q4_0 => write!(f, "q4_0"),
+        }
+    }
+}

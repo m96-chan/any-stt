@@ -13,7 +13,7 @@
 //!   - Model load failure → SttError::ModelNotFound
 //!   - Invalid audio → SttError::InvalidAudio
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::path::Path;
 use std::time::Instant;
 
@@ -23,6 +23,7 @@ use any_stt::hardware::HardwareInfo;
 use any_stt::{SttEngine, SttResult};
 
 use crate::ffi::*;
+use crate::helpers;
 
 /// Hybrid CPU+NPU Whisper engine with automatic fallback.
 ///
@@ -69,14 +70,7 @@ impl WhisperQnnEngine {
             });
         }
 
-        let path_cstr = CString::new(
-            model_path.to_str().ok_or_else(|| SttError::ModelNotFound {
-                path: model_path.to_path_buf(),
-            })?,
-        )
-        .map_err(|_| SttError::ModelNotFound {
-            path: model_path.to_path_buf(),
-        })?;
+        let path_cstr = helpers::model_path_to_cstring(model_path)?;
 
         let lang = CString::new(language).map_err(|_| {
             SttError::TranscriptionFailed("invalid language string".into())
@@ -93,9 +87,7 @@ impl WhisperQnnEngine {
             });
         }
 
-        let n_threads = std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(4);
+        let n_threads = helpers::default_n_threads();
 
         // Probe NPU availability — failure is not an error, just means CPU-only
         let npu_status = match qnn_backend::QnnLibrary::load_htp() {
@@ -118,75 +110,17 @@ impl WhisperQnnEngine {
         })
     }
 
-    fn make_params(&self) -> *mut WhisperFullParams {
-        let params = unsafe { shim_default_params(WhisperSamplingStrategy::Greedy) };
-        unsafe {
-            shim_params_set_language(params, self.language.as_ptr());
-            shim_params_set_n_threads(params, self.n_threads);
-            shim_params_set_translate(params, false);
-            shim_params_set_print_special(params, false);
-            shim_params_set_print_progress(params, false);
-            shim_params_set_print_realtime(params, false);
-            shim_params_set_print_timestamps(params, false);
-            shim_params_set_single_segment(params, false);
-            shim_params_set_suppress_nst(params, true);
-        }
-        params
-    }
-
-    fn collect_text(&self) -> String {
-        let n_segments = unsafe { whisper_full_n_segments(self.ctx) };
-        let mut text = String::new();
-        for i in 0..n_segments {
-            let seg = unsafe { whisper_full_get_segment_text(self.ctx, i) };
-            if !seg.is_null() {
-                text.push_str(&unsafe { CStr::from_ptr(seg) }.to_string_lossy());
-            }
-        }
-        text
-    }
-
-    fn detect_language(&self) -> String {
-        let lang_id = unsafe { whisper_full_lang_id(self.ctx) };
-        let lang_str = unsafe { whisper_lang_str(lang_id) };
-        if !lang_str.is_null() {
-            unsafe { CStr::from_ptr(lang_str) }
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            self.language.to_string_lossy().into_owned()
-        }
-    }
-
-    fn run_whisper_full(&self, audio: &[f32]) -> Result<(), SttError> {
+    fn run_full_pipeline(&self, audio: &[f32]) -> Result<(), SttError> {
         if audio.is_empty() {
             return Err(SttError::InvalidAudio("empty audio buffer".into()));
         }
-
-        let params = self.make_params();
-        if params.is_null() {
-            return Err(SttError::TranscriptionFailed(
-                "failed to allocate whisper params".into(),
-            ));
-        }
-
-        let ret = unsafe {
-            shim_whisper_full(self.ctx, params, audio.as_ptr(), audio.len() as i32)
-        };
-        unsafe { shim_free_params(params) };
-
-        if ret != 0 {
-            return Err(SttError::TranscriptionFailed(format!(
-                "whisper_full returned error code {ret}"
-            )));
-        }
-        Ok(())
+        let params = helpers::create_params(&self.language, self.n_threads)?;
+        helpers::run_whisper_full(self.ctx, params, audio)
     }
 }
 
 impl SttEngine for WhisperQnnEngine {
     fn transcribe(&self, audio: &[f32]) -> Result<SttResult, SttError> {
-        // Validate audio
         if audio.is_empty() {
             return Err(SttError::InvalidAudio("empty audio buffer".into()));
         }
@@ -198,25 +132,10 @@ impl SttEngine for WhisperQnnEngine {
         }
 
         let start = Instant::now();
+        self.run_full_pipeline(audio)?;
 
-        // Run whisper.cpp full pipeline (mel + conv + encode + decode)
-        // NPU acceleration would replace the encode step; for now CPU handles all.
-        self.run_whisper_full(audio)?;
-
-        let text = self.collect_text();
-        let language = self.detect_language();
-
-        let backend_used = match &self.npu_status {
-            NpuStatus::Active => Backend::Qnn,
-            _ => Backend::Cpu,
-        };
-
-        Ok(SttResult {
-            text,
-            language,
-            duration_ms: start.elapsed().as_secs_f64() * 1000.0,
-            backend_used,
-        })
+        let fallback_lang = self.language.to_string_lossy();
+        Ok(helpers::collect_result(self.ctx, start, &fallback_lang, self.active_backend()))
     }
 
     fn is_ready(&self) -> bool {

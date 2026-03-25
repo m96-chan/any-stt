@@ -465,4 +465,129 @@ mod tests {
         let sel = select(&SttConfig::default(), &hw);
         assert_eq!(sel.backend, Backend::CoreMl);
     }
+
+    // --- Additional quantization tests ---
+
+    #[test]
+    fn gpu_vram_used_for_quantization_selection() {
+        // CUDA backend: should use VRAM (not system RAM) for quantization
+        let hw = make_hw(
+            Platform::Linux,
+            Some(GpuInfo {
+                vendor: GpuVendor::Nvidia,
+                name: "RTX 3060".into(),
+                vram_mb: 12000,
+                driver: "555".into(),
+            }),
+            None,
+            64000, // lots of RAM but only 12GB VRAM
+        );
+        let config = SttConfig {
+            model: Model::LargeV3,
+            ..Default::default()
+        };
+        let sel = select(&config, &hw);
+        assert_eq!(sel.backend, Backend::Cuda);
+        // 3100 MB f16, VRAM=12000 → f16 fits
+        assert_eq!(sel.quantization, Quantization::F16);
+    }
+
+    #[test]
+    fn gpu_zero_vram_falls_back_to_ram() {
+        // Apple GPU: vram_mb=0, should fall back to system RAM
+        let hw = make_hw(
+            Platform::MacOs,
+            Some(apple_gpu()),
+            None, // no NPU → Metal
+            8000,
+        );
+        let config = SttConfig {
+            model: Model::LargeV3,
+            ..Default::default()
+        };
+        let sel = select(&config, &hw);
+        assert_eq!(sel.backend, Backend::Metal);
+        // 3100 MB f16, RAM=8000 → f16 fits
+        assert_eq!(sel.quantization, Quantization::F16);
+    }
+
+    #[test]
+    fn npu_uses_system_ram_for_quantization() {
+        let hw = make_hw(
+            Platform::MacOs,
+            Some(apple_gpu()),
+            Some(NpuInfo { npu_type: NpuType::CoreMl, available: true }),
+            500, // limited RAM
+        );
+        let config = SttConfig {
+            model: Model::LargeV3,
+            ..Default::default()
+        };
+        let sel = select(&config, &hw);
+        assert_eq!(sel.backend, Backend::CoreMl);
+        // 3100 * ratio must fit in 500 MB → very aggressive quant
+        assert_eq!(sel.quantization, Quantization::Q4_0);
+    }
+
+    #[test]
+    fn android_qnn_htp_selects_qnn() {
+        let hw = make_hw(
+            Platform::Android,
+            Some(GpuInfo {
+                vendor: GpuVendor::Qualcomm,
+                name: "Adreno 750".into(),
+                vram_mb: 0,
+                driver: String::new(),
+            }),
+            Some(NpuInfo { npu_type: NpuType::QnnHtp, available: true }),
+            12000,
+        );
+        let sel = select(&SttConfig::default(), &hw);
+        assert_eq!(sel.backend, Backend::Qnn);
+    }
+
+    #[test]
+    fn all_model_sizes_are_nonzero() {
+        let models = [
+            Model::Tiny, Model::TinyEn, Model::Base, Model::BaseEn,
+            Model::Small, Model::SmallEn, Model::Medium, Model::MediumEn,
+            Model::LargeV1, Model::LargeV2, Model::LargeV3, Model::LargeV3Turbo,
+            Model::DistilLargeV2, Model::DistilLargeV3, Model::DistilMediumEn,
+            Model::DistilSmallEn, Model::KotobaV1, Model::KotobaV2,
+            Model::Custom("unknown".into()),
+        ];
+        for m in &models {
+            assert!(model_size_estimate_f16_mb(m) > 0, "model {m:?} has zero size estimate");
+        }
+    }
+
+    #[test]
+    fn model_sizes_are_ordered() {
+        assert!(model_size_estimate_f16_mb(&Model::Tiny) < model_size_estimate_f16_mb(&Model::Base));
+        assert!(model_size_estimate_f16_mb(&Model::Base) < model_size_estimate_f16_mb(&Model::Small));
+        assert!(model_size_estimate_f16_mb(&Model::Small) < model_size_estimate_f16_mb(&Model::Medium));
+        assert!(model_size_estimate_f16_mb(&Model::Medium) < model_size_estimate_f16_mb(&Model::LargeV3));
+    }
+
+    #[test]
+    fn quantization_ratios_are_decreasing() {
+        for window in QUANTIZATION_RATIOS.windows(2) {
+            assert!(
+                window[0].1 > window[1].1,
+                "{:?} ratio {} should be > {:?} ratio {}",
+                window[0].0, window[0].1, window[1].0, window[1].1
+            );
+        }
+    }
+
+    #[test]
+    fn selection_debug_impl() {
+        let sel = Selection {
+            backend: Backend::Cpu,
+            quantization: Quantization::Q8_0,
+        };
+        let dbg = format!("{sel:?}");
+        assert!(dbg.contains("Cpu"));
+        assert!(dbg.contains("Q8_0"));
+    }
 }

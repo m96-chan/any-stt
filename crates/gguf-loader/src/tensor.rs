@@ -364,15 +364,246 @@ fn f16_to_f32(bits: u16) -> f32 {
 mod tests {
     use super::*;
 
+    // --- f16_to_f32 ---
+
     #[test]
-    fn f16_conversions() {
+    fn f16_zero() {
         assert_eq!(f16_to_f32(0x0000), 0.0);
+        // Negative zero
+        assert_eq!(f16_to_f32(0x8000), -0.0);
+        assert!(f16_to_f32(0x8000).is_sign_negative());
+    }
+
+    #[test]
+    fn f16_normal_values() {
         assert_eq!(f16_to_f32(0x3C00), 1.0);
         assert_eq!(f16_to_f32(0xBC00), -1.0);
         assert!((f16_to_f32(0x4200) - 3.0).abs() < 0.001);
-        // Infinity
+        assert!((f16_to_f32(0x3800) - 0.5).abs() < 0.001);
+        assert!((f16_to_f32(0x4000) - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn f16_infinity_and_nan() {
         assert!(f16_to_f32(0x7C00).is_infinite());
-        // NaN
+        assert!(f16_to_f32(0x7C00).is_sign_positive());
+        assert!(f16_to_f32(0xFC00).is_infinite());
+        assert!(f16_to_f32(0xFC00).is_sign_negative());
         assert!(f16_to_f32(0x7E00).is_nan());
+    }
+
+    #[test]
+    fn f16_subnormal() {
+        // Smallest positive subnormal: 0x0001 = 2^-24 ≈ 5.96e-8
+        let val = f16_to_f32(0x0001);
+        assert!(val > 0.0);
+        assert!(val < 1e-6);
+    }
+
+    // --- GgmlType ---
+
+    #[test]
+    fn ggml_type_from_u32_known() {
+        assert_eq!(GgmlType::from_u32(0).unwrap(), GgmlType::F32);
+        assert_eq!(GgmlType::from_u32(1).unwrap(), GgmlType::F16);
+        assert_eq!(GgmlType::from_u32(2).unwrap(), GgmlType::Q4_0);
+        assert_eq!(GgmlType::from_u32(8).unwrap(), GgmlType::Q8_0);
+        assert_eq!(GgmlType::from_u32(30).unwrap(), GgmlType::Bf16);
+    }
+
+    #[test]
+    fn ggml_type_from_u32_unknown() {
+        assert!(GgmlType::from_u32(4).is_err()); // gap in enum
+        assert!(GgmlType::from_u32(5).is_err());
+        assert!(GgmlType::from_u32(15).is_err());
+        assert!(GgmlType::from_u32(999).is_err());
+    }
+
+    #[test]
+    fn ggml_type_block_size() {
+        assert_eq!(GgmlType::F32.block_size(), 1);
+        assert_eq!(GgmlType::F16.block_size(), 1);
+        assert_eq!(GgmlType::Q4_0.block_size(), 32);
+        assert_eq!(GgmlType::Q8_0.block_size(), 32);
+        assert_eq!(GgmlType::Q6K.block_size(), 256);
+    }
+
+    #[test]
+    fn ggml_type_size() {
+        assert_eq!(GgmlType::F32.type_size(), 4);
+        assert_eq!(GgmlType::F16.type_size(), 2);
+        assert_eq!(GgmlType::Q4_0.type_size(), 18);
+        assert_eq!(GgmlType::Q8_0.type_size(), 34);
+        assert_eq!(GgmlType::F64.type_size(), 8);
+        assert_eq!(GgmlType::I8.type_size(), 1);
+    }
+
+    #[test]
+    fn ggml_type_data_size() {
+        // F32: 1 element per block, 4 bytes each
+        assert_eq!(GgmlType::F32.data_size(100), 400);
+        // F16: 1 element per block, 2 bytes each
+        assert_eq!(GgmlType::F16.data_size(100), 200);
+        // Q4_0: 32 elements per block, 18 bytes each
+        assert_eq!(GgmlType::Q4_0.data_size(32), 18);
+        assert_eq!(GgmlType::Q4_0.data_size(64), 36);
+        // Q8_0: 32 elements per block, 34 bytes each
+        assert_eq!(GgmlType::Q8_0.data_size(32), 34);
+        // Partial blocks round up
+        assert_eq!(GgmlType::Q4_0.data_size(33), 36); // 2 blocks
+    }
+
+    // --- TensorInfo ---
+
+    #[test]
+    fn tensor_info_n_elements() {
+        let info = TensorInfo {
+            name: "test".into(),
+            n_dims: 3,
+            dims: [10, 20, 30, 1],
+            dtype: GgmlType::F32,
+            offset: 0,
+        };
+        assert_eq!(info.n_elements(), 6000);
+    }
+
+    #[test]
+    fn tensor_info_n_elements_1d() {
+        let info = TensorInfo {
+            name: "bias".into(),
+            n_dims: 1,
+            dims: [384, 1, 1, 1],
+            dtype: GgmlType::F32,
+            offset: 0,
+        };
+        assert_eq!(info.n_elements(), 384);
+    }
+
+    #[test]
+    fn tensor_info_data_size() {
+        let info = TensorInfo {
+            name: "weight".into(),
+            n_dims: 2,
+            dims: [384, 80, 1, 1],
+            dtype: GgmlType::F16,
+            offset: 0,
+        };
+        // 384 * 80 = 30720 elements, 2 bytes each
+        assert_eq!(info.data_size(), 61440);
+    }
+
+    // --- Dequantization ---
+
+    #[test]
+    fn dequantize_f16_simple() {
+        // Two f16 values: 1.0 (0x3C00) and -1.0 (0xBC00)
+        let data: Vec<u8> = vec![0x00, 0x3C, 0x00, 0xBC];
+        let result = dequantize_f16(&data, 2).unwrap();
+        assert_eq!(result.len(), 2);
+        assert!((result[0] - 1.0).abs() < 0.001);
+        assert!((result[1] - (-1.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn dequantize_f16_too_short() {
+        let data: Vec<u8> = vec![0x00, 0x3C];
+        assert!(dequantize_f16(&data, 2).is_err());
+    }
+
+    #[test]
+    fn dequantize_q8_0_one_block() {
+        // One Q8_0 block: f16 scale (1.0 = 0x3C00) + 32 int8 values
+        let mut data = vec![0x00u8, 0x3C]; // scale = 1.0
+        for i in 0..32i8 {
+            data.push(i as u8);
+        }
+        let result = dequantize_q8_0(&data, 32).unwrap();
+        assert_eq!(result.len(), 32);
+        // q[0] = 0 * 1.0 = 0.0
+        assert!((result[0] - 0.0).abs() < 0.001);
+        // q[1] = 1 * 1.0 = 1.0
+        assert!((result[1] - 1.0).abs() < 0.001);
+        // q[10] = 10 * 1.0 = 10.0
+        assert!((result[10] - 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn dequantize_q8_0_too_short() {
+        let data = vec![0u8; 10]; // too small for a block
+        assert!(dequantize_q8_0(&data, 32).is_err());
+    }
+
+    #[test]
+    fn dequantize_q4_0_one_block() {
+        // One Q4_0 block: f16 scale (1.0 = 0x3C00) + 16 bytes of 4-bit nibbles
+        let mut data = vec![0x00u8, 0x3C]; // scale = 1.0
+        // All nibbles = 0x00 → low=0, high=0 → both produce (0 - 8) * 1.0 = -8.0
+        data.extend_from_slice(&[0x00; 16]);
+        let result = dequantize_q4_0(&data, 32).unwrap();
+        assert_eq!(result.len(), 32);
+        // Each nibble is 0, so value = (0 - 8) * 1.0 = -8.0
+        for v in &result {
+            assert!((*v - (-8.0)).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn dequantize_q4_0_varied_nibbles() {
+        let mut data = vec![0x00u8, 0x3C]; // scale = 1.0
+        // First byte: low=8 (0x8), high=8 (0x8) → 0x88
+        // value for nibble 8: (8 - 8) * 1.0 = 0.0
+        data.push(0x88);
+        data.extend_from_slice(&[0x00; 15]); // rest are 0
+        let result = dequantize_q4_0(&data, 32).unwrap();
+        // First two elements: nibble=8 → (8-8)*1.0 = 0.0
+        assert!((result[0] - 0.0).abs() < 0.001);
+        assert!((result[1] - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn dequantize_q5_0_one_block() {
+        // Q5_0 block: scale(2) + high_bits(4) + nibbles(16) = 22 bytes
+        let mut data = vec![0x00u8, 0x3C]; // scale = 1.0
+        data.extend_from_slice(&[0x00; 4]); // high bits all 0
+        // All nibbles = 0 → lo=0, hi=0, val = (0|0<<4) - 16 = -16
+        data.extend_from_slice(&[0x00; 16]);
+        let result = dequantize_q5_0(&data, 32).unwrap();
+        assert_eq!(result.len(), 32);
+        for v in &result {
+            assert!((*v - (-16.0)).abs() < 0.001);
+        }
+    }
+
+    // --- TensorView ---
+
+    #[test]
+    fn tensor_view_as_f32() {
+        let info = TensorInfo {
+            name: "test".into(),
+            n_dims: 1,
+            dims: [3, 1, 1, 1],
+            dtype: GgmlType::F32,
+            offset: 0,
+        };
+        let values: [f32; 3] = [1.0, 2.0, 3.0];
+        let data: &[u8] = unsafe {
+            std::slice::from_raw_parts(values.as_ptr() as *const u8, 12)
+        };
+        let view = TensorView::new(&info, data);
+        let f32s = view.as_f32().unwrap();
+        assert_eq!(f32s, &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn tensor_view_as_f32_wrong_type() {
+        let info = TensorInfo {
+            name: "test".into(),
+            n_dims: 1,
+            dims: [3, 1, 1, 1],
+            dtype: GgmlType::F16,
+            offset: 0,
+        };
+        let view = TensorView::new(&info, &[0u8; 6]);
+        assert!(view.as_f32().is_none());
     }
 }

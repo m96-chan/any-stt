@@ -152,6 +152,19 @@ fn read_meta_value<R: Read + Seek>(
     }
 }
 
+/// Read `len` elements using `read_fn`, collecting into a Vec.
+fn read_array_elems<R: Read + Seek, T>(
+    r: &mut R,
+    len: usize,
+    read_fn: fn(&mut R) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
+    let mut v = Vec::with_capacity(len);
+    for _ in 0..len {
+        v.push(read_fn(r)?);
+    }
+    Ok(v)
+}
+
 fn read_array_value<R: Read + Seek>(r: &mut R) -> Result<MetaValue, String> {
     let elem_type_id = read_u32(r)?;
     let elem_type = GgufMetaType::from_u32(elem_type_id)?;
@@ -162,90 +175,69 @@ fn read_array_value<R: Read + Seek>(r: &mut R) -> Result<MetaValue, String> {
     }
 
     match elem_type {
-        GgufMetaType::Uint8 => {
-            let mut v = vec![0u8; len];
-            for item in v.iter_mut() {
-                *item = read_u8(r)?;
-            }
-            Ok(MetaValue::ArrayUint8(v))
-        }
-        GgufMetaType::Int8 => {
-            let mut v = Vec::with_capacity(len);
-            for _ in 0..len {
-                v.push(read_i8(r)?);
-            }
-            Ok(MetaValue::ArrayInt8(v))
-        }
-        GgufMetaType::Uint16 => {
-            let mut v = Vec::with_capacity(len);
-            for _ in 0..len {
-                v.push(read_u16(r)?);
-            }
-            Ok(MetaValue::ArrayUint16(v))
-        }
-        GgufMetaType::Int16 => {
-            let mut v = Vec::with_capacity(len);
-            for _ in 0..len {
-                v.push(read_i16(r)?);
-            }
-            Ok(MetaValue::ArrayInt16(v))
-        }
-        GgufMetaType::Uint32 => {
-            let mut v = Vec::with_capacity(len);
-            for _ in 0..len {
-                v.push(read_u32(r)?);
-            }
-            Ok(MetaValue::ArrayUint32(v))
-        }
-        GgufMetaType::Int32 => {
-            let mut v = Vec::with_capacity(len);
-            for _ in 0..len {
-                v.push(read_i32(r)?);
-            }
-            Ok(MetaValue::ArrayInt32(v))
-        }
-        GgufMetaType::Float32 => {
-            let mut v = Vec::with_capacity(len);
-            for _ in 0..len {
-                v.push(read_f32(r)?);
-            }
-            Ok(MetaValue::ArrayFloat32(v))
-        }
-        GgufMetaType::Bool => {
-            let mut v = Vec::with_capacity(len);
-            for _ in 0..len {
-                v.push(read_bool(r)?);
-            }
-            Ok(MetaValue::ArrayBool(v))
-        }
-        GgufMetaType::String => {
-            let mut v = Vec::with_capacity(len);
-            for _ in 0..len {
-                v.push(read_string(r)?);
-            }
-            Ok(MetaValue::ArrayString(v))
-        }
-        GgufMetaType::Uint64 => {
-            let mut v = Vec::with_capacity(len);
-            for _ in 0..len {
-                v.push(read_u64(r)?);
-            }
-            Ok(MetaValue::ArrayUint64(v))
-        }
-        GgufMetaType::Int64 => {
-            let mut v = Vec::with_capacity(len);
-            for _ in 0..len {
-                v.push(read_i64(r)?);
-            }
-            Ok(MetaValue::ArrayInt64(v))
-        }
-        GgufMetaType::Float64 => {
-            let mut v = Vec::with_capacity(len);
-            for _ in 0..len {
-                v.push(read_f64(r)?);
-            }
-            Ok(MetaValue::ArrayFloat64(v))
-        }
+        GgufMetaType::Uint8 => Ok(MetaValue::ArrayUint8(read_array_elems(r, len, read_u8)?)),
+        GgufMetaType::Int8 => Ok(MetaValue::ArrayInt8(read_array_elems(r, len, read_i8)?)),
+        GgufMetaType::Uint16 => Ok(MetaValue::ArrayUint16(read_array_elems(r, len, read_u16)?)),
+        GgufMetaType::Int16 => Ok(MetaValue::ArrayInt16(read_array_elems(r, len, read_i16)?)),
+        GgufMetaType::Uint32 => Ok(MetaValue::ArrayUint32(read_array_elems(r, len, read_u32)?)),
+        GgufMetaType::Int32 => Ok(MetaValue::ArrayInt32(read_array_elems(r, len, read_i32)?)),
+        GgufMetaType::Float32 => Ok(MetaValue::ArrayFloat32(read_array_elems(r, len, read_f32)?)),
+        GgufMetaType::Bool => Ok(MetaValue::ArrayBool(read_array_elems(r, len, read_bool)?)),
+        GgufMetaType::String => Ok(MetaValue::ArrayString(read_array_elems(r, len, read_string)?)),
+        GgufMetaType::Uint64 => Ok(MetaValue::ArrayUint64(read_array_elems(r, len, read_u64)?)),
+        GgufMetaType::Int64 => Ok(MetaValue::ArrayInt64(read_array_elems(r, len, read_i64)?)),
+        GgufMetaType::Float64 => Ok(MetaValue::ArrayFloat64(read_array_elems(r, len, read_f64)?)),
         GgufMetaType::Array => Err("nested arrays not supported".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meta_type_from_u32_all_valid() {
+        assert_eq!(GgufMetaType::from_u32(0).unwrap(), GgufMetaType::Uint8);
+        assert_eq!(GgufMetaType::from_u32(1).unwrap(), GgufMetaType::Int8);
+        assert_eq!(GgufMetaType::from_u32(6).unwrap(), GgufMetaType::Float32);
+        assert_eq!(GgufMetaType::from_u32(8).unwrap(), GgufMetaType::String);
+        assert_eq!(GgufMetaType::from_u32(9).unwrap(), GgufMetaType::Array);
+        assert_eq!(GgufMetaType::from_u32(12).unwrap(), GgufMetaType::Float64);
+    }
+
+    #[test]
+    fn meta_type_from_u32_invalid() {
+        assert!(GgufMetaType::from_u32(13).is_err());
+        assert!(GgufMetaType::from_u32(255).is_err());
+    }
+
+    #[test]
+    fn meta_value_as_u32() {
+        assert_eq!(MetaValue::Uint32(42).as_u32(), Some(42));
+        assert_eq!(MetaValue::Uint8(5).as_u32(), Some(5));
+        assert_eq!(MetaValue::Uint16(1000).as_u32(), Some(1000));
+        assert_eq!(MetaValue::Int32(10).as_u32(), Some(10));
+        assert_eq!(MetaValue::Float32(1.0).as_u32(), None);
+        assert_eq!(MetaValue::String("test".into()).as_u32(), None);
+    }
+
+    #[test]
+    fn meta_value_as_f32() {
+        assert_eq!(MetaValue::Float32(3.14).as_f32(), Some(3.14));
+        assert_eq!(MetaValue::Uint32(1).as_f32(), None);
+    }
+
+    #[test]
+    fn meta_value_as_str() {
+        let v = MetaValue::String("hello".into());
+        assert_eq!(v.as_str(), Some("hello"));
+        assert_eq!(MetaValue::Uint32(1).as_str(), None);
+    }
+
+    #[test]
+    fn meta_value_as_u64() {
+        assert_eq!(MetaValue::Uint64(999).as_u64(), Some(999));
+        assert_eq!(MetaValue::Uint32(42).as_u64(), Some(42));
+        assert_eq!(MetaValue::Float32(1.0).as_u64(), None);
     }
 }

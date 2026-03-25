@@ -198,16 +198,8 @@ fn gelu_vec(data: &[f32]) -> Vec<f32> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn gelu_basic() {
-        assert!((gelu(0.0)).abs() < 1e-6);
-        assert!((gelu(1.0) - 0.8412).abs() < 0.01);
-        assert!((gelu(-1.0) - (-0.1588)).abs() < 0.01);
-    }
-
-    #[test]
-    fn conv1d_identity_kernel() {
-        let prep = Preprocessor {
+    fn dummy_prep() -> Preprocessor {
+        Preprocessor {
             conv1_weight: vec![],
             conv1_bias: vec![],
             conv2_weight: vec![],
@@ -216,15 +208,150 @@ mod tests {
             n_state: 0,
             n_ctx: 0,
             n_mels: 0,
-        };
+        }
+    }
 
-        // 1 input channel, 1 output channel, kernel_size=1, no padding, stride=1
+    // --- GELU ---
+
+    #[test]
+    fn gelu_zero() {
+        assert!((gelu(0.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gelu_positive() {
+        assert!((gelu(1.0) - 0.8412).abs() < 0.01);
+        assert!((gelu(2.0) - 1.9545).abs() < 0.01);
+    }
+
+    #[test]
+    fn gelu_negative() {
+        assert!((gelu(-1.0) - (-0.1588)).abs() < 0.01);
+        // Large negative → ~0
+        assert!(gelu(-5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn gelu_large_positive() {
+        // Large positive → ~x
+        let x = 10.0;
+        assert!((gelu(x) - x).abs() < 0.01);
+    }
+
+    #[test]
+    fn gelu_vec_basic() {
+        let input = vec![0.0, 1.0, -1.0];
+        let output = gelu_vec(&input);
+        assert_eq!(output.len(), 3);
+        assert!((output[0]).abs() < 1e-6);
+        assert!((output[1] - 0.8412).abs() < 0.01);
+        assert!((output[2] - (-0.1588)).abs() < 0.01);
+    }
+
+    #[test]
+    fn gelu_vec_empty() {
+        assert!(gelu_vec(&[]).is_empty());
+    }
+
+    // --- Conv1d ---
+
+    #[test]
+    fn conv1d_identity_kernel() {
+        let prep = dummy_prep();
         let input = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let weight = vec![2.0]; // kernel [1, 1, 1]
+        let weight = vec![2.0]; // [1, 1, 1]
         let bias = vec![0.5];
         let output = prep.conv1d(&input, 5, 1, &weight, &bias, 1, 1, 0, 1);
         assert_eq!(output.len(), 5);
         assert!((output[0] - 2.5).abs() < 1e-6); // 1*2 + 0.5
         assert!((output[1] - 4.5).abs() < 1e-6); // 2*2 + 0.5
+    }
+
+    #[test]
+    fn conv1d_with_padding() {
+        let prep = dummy_prep();
+        // 1 in_channel, 1 out_channel, kernel=3, padding=1, stride=1
+        let input = vec![1.0, 2.0, 3.0]; // length=3
+        let weight = vec![1.0, 1.0, 1.0]; // [1, 1, 3] — sum kernel
+        let bias = vec![0.0];
+        let output = prep.conv1d(&input, 3, 1, &weight, &bias, 1, 3, 1, 1);
+        assert_eq!(output.len(), 3); // same padding preserves length
+        // output[0]: pad + 1 + 2 = 3.0
+        assert!((output[0] - 3.0).abs() < 1e-6);
+        // output[1]: 1 + 2 + 3 = 6.0
+        assert!((output[1] - 6.0).abs() < 1e-6);
+        // output[2]: 2 + 3 + pad = 5.0
+        assert!((output[2] - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn conv1d_with_stride() {
+        let prep = dummy_prep();
+        // length=6, kernel=1, stride=2 → output length = 3
+        let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let weight = vec![1.0]; // identity
+        let bias = vec![0.0];
+        let output = prep.conv1d(&input, 6, 1, &weight, &bias, 1, 1, 0, 2);
+        assert_eq!(output.len(), 3);
+        assert!((output[0] - 1.0).abs() < 1e-6);
+        assert!((output[1] - 3.0).abs() < 1e-6);
+        assert!((output[2] - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn conv1d_multi_channel() {
+        let prep = dummy_prep();
+        // 2 in_channels, 1 out_channel, kernel=1
+        // input: channel0=[1,2,3], channel1=[4,5,6]
+        let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        // weight [1, 2, 1]: w0=1.0, w1=2.0
+        let weight = vec![1.0, 2.0];
+        let bias = vec![0.0];
+        let output = prep.conv1d(&input, 3, 2, &weight, &bias, 1, 1, 0, 1);
+        assert_eq!(output.len(), 3);
+        // output[0] = 1*1 + 4*2 = 9
+        assert!((output[0] - 9.0).abs() < 1e-6);
+        // output[1] = 2*1 + 5*2 = 12
+        assert!((output[1] - 12.0).abs() < 1e-6);
+    }
+
+    // --- Preprocessor ---
+
+    #[test]
+    fn dummy_weights_dimensions() {
+        let prep = Preprocessor::with_dummy_weights(384, 1500, 80);
+        assert_eq!(prep.n_state(), 384);
+        assert_eq!(prep.n_ctx(), 1500);
+        assert_eq!(prep.n_mels(), 80);
+    }
+
+    #[test]
+    fn dummy_weights_weight_sizes() {
+        let prep = Preprocessor::with_dummy_weights(384, 1500, 80);
+        assert_eq!(prep.conv1_weight.len(), 384 * 80 * 3);
+        assert_eq!(prep.conv1_bias.len(), 384);
+        assert_eq!(prep.conv2_weight.len(), 384 * 384 * 3);
+        assert_eq!(prep.conv2_bias.len(), 384);
+        assert_eq!(prep.positional_embedding.len(), 1500 * 384);
+    }
+
+    #[test]
+    fn process_mel_output_shape() {
+        let prep = Preprocessor::with_dummy_weights(384, 1500, 80);
+        // Create mel input: [80, 3000] (80 mels, 3000 frames)
+        let mel = vec![0.0f32; 80 * 3000];
+        let output = prep.process_mel(&mel, 3000);
+        // Output should be [n_ctx, n_state] = [1500, 384]
+        assert_eq!(output.len(), 1500 * 384);
+    }
+
+    #[test]
+    fn process_mel_short_input() {
+        let prep = Preprocessor::with_dummy_weights(384, 1500, 80);
+        // Very short mel: [80, 100]
+        let mel = vec![0.0f32; 80 * 100];
+        let output = prep.process_mel(&mel, 100);
+        // Output is still n_ctx * n_state (zero-padded beyond conv2 output)
+        assert_eq!(output.len(), 1500 * 384);
     }
 }

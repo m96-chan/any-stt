@@ -1,5 +1,6 @@
 pub mod decoder;
 pub mod ffi;
+pub mod helpers;
 pub mod hybrid;
 pub mod preprocess;
 pub mod qnn;
@@ -7,7 +8,7 @@ pub mod qnn;
 #[cfg(target_os = "android")]
 pub mod dlopen_ffi;
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::path::Path;
 use std::time::Instant;
 
@@ -17,6 +18,7 @@ use any_stt::hardware::HardwareInfo;
 use any_stt::{SttEngine, SttResult};
 
 use ffi::*;
+use helpers::{collect_result, create_params, model_path_to_cstring, run_whisper_full};
 
 /// Safe wrapper around a whisper.cpp context.
 ///
@@ -44,16 +46,7 @@ impl WhisperEngine {
         backend: Backend,
         hardware_info: HardwareInfo,
     ) -> Result<Self, SttError> {
-        let path_cstr = CString::new(
-            model_path
-                .to_str()
-                .ok_or_else(|| SttError::ModelNotFound {
-                    path: model_path.to_path_buf(),
-                })?,
-        )
-        .map_err(|_| SttError::ModelNotFound {
-            path: model_path.to_path_buf(),
-        })?;
+        let path_cstr = model_path_to_cstring(model_path)?;
 
         let mut cparams = unsafe { whisper_context_default_params() };
         cparams.use_gpu = matches!(backend, Backend::Cuda | Backend::Metal | Backend::Vulkan);
@@ -70,16 +63,12 @@ impl WhisperEngine {
             SttError::TranscriptionFailed("invalid language string".into())
         })?;
 
-        let n_threads = std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(4);
-
         Ok(Self {
             ctx,
             hardware_info,
             backend,
             language: lang,
-            n_threads,
+            n_threads: helpers::default_n_threads(),
         })
     }
 }
@@ -99,73 +88,9 @@ impl SttEngine for WhisperEngine {
         }
 
         let start = Instant::now();
-
-        // Create params via shim.
-        let params =
-            unsafe { shim_default_params(WhisperSamplingStrategy::Greedy) };
-        if params.is_null() {
-            return Err(SttError::TranscriptionFailed(
-                "failed to allocate whisper params".into(),
-            ));
-        }
-
-        // Configure params.
-        unsafe {
-            shim_params_set_language(params, self.language.as_ptr());
-            shim_params_set_n_threads(params, self.n_threads);
-            shim_params_set_translate(params, false);
-            shim_params_set_print_special(params, false);
-            shim_params_set_print_progress(params, false);
-            shim_params_set_print_realtime(params, false);
-            shim_params_set_print_timestamps(params, false);
-            shim_params_set_single_segment(params, false);
-            shim_params_set_suppress_nst(params, true);
-        }
-
-        // Run inference.
-        let ret = unsafe {
-            shim_whisper_full(self.ctx, params, audio.as_ptr(), audio.len() as i32)
-        };
-
-        // Free params immediately after use.
-        unsafe { shim_free_params(params) };
-
-        if ret != 0 {
-            return Err(SttError::TranscriptionFailed(format!(
-                "whisper_full returned error code {ret}"
-            )));
-        }
-
-        // Collect segments.
-        let n_segments = unsafe { whisper_full_n_segments(self.ctx) };
-        let mut text = String::new();
-        for i in 0..n_segments {
-            let segment_text = unsafe { whisper_full_get_segment_text(self.ctx, i) };
-            if !segment_text.is_null() {
-                let s = unsafe { CStr::from_ptr(segment_text) };
-                text.push_str(&s.to_string_lossy());
-            }
-        }
-
-        // Get detected language.
-        let lang_id = unsafe { whisper_full_lang_id(self.ctx) };
-        let lang_str = unsafe { whisper_lang_str(lang_id) };
-        let language = if !lang_str.is_null() {
-            unsafe { CStr::from_ptr(lang_str) }
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            "unknown".to_string()
-        };
-
-        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-        Ok(SttResult {
-            text,
-            language,
-            duration_ms,
-            backend_used: self.backend,
-        })
+        let params = create_params(&self.language, self.n_threads)?;
+        run_whisper_full(self.ctx, params, audio)?;
+        Ok(collect_result(self.ctx, start, "unknown", self.backend))
     }
 
     fn is_ready(&self) -> bool {
@@ -207,7 +132,7 @@ pub fn initialize(config: &any_stt::SttConfig) -> Result<Box<dyn SttEngine>, Stt
     let hw = any_stt::detect_hardware();
     let selection = any_stt::selector::select(config, &hw);
 
-    eprintln!("initialize: selected backend={:?}, quantization={:?}",
+    eprintln!("initialize: selected backend={}, quantization={}",
         selection.backend, selection.quantization);
 
     match selection.backend {
@@ -219,11 +144,11 @@ pub fn initialize(config: &any_stt::SttConfig) -> Result<Box<dyn SttEngine>, Stt
             );
             match engine {
                 Ok(e) => {
-                    eprintln!("initialize: using {:?} backend", selection.backend);
+                    eprintln!("initialize: using {} backend", selection.backend);
                     return Ok(Box::new(e));
                 }
                 Err(e) => {
-                    eprintln!("initialize: {:?} failed ({e}), falling back to CPU",
+                    eprintln!("initialize: {} failed ({e}), falling back to CPU",
                         selection.backend);
                 }
             }
@@ -233,8 +158,7 @@ pub fn initialize(config: &any_stt::SttConfig) -> Result<Box<dyn SttEngine>, Stt
         Backend::Qnn => {
             match hybrid::WhisperQnnEngine::new(model_path, &config.language, hw.clone()) {
                 Ok(engine) => {
-                    eprintln!("initialize: using {} backend",
-                        if engine.active_backend() == Backend::Qnn { "QNN NPU" } else { "CPU (QNN unavailable)" });
+                    eprintln!("initialize: using {} backend", engine.active_backend());
                     return Ok(Box::new(engine));
                 }
                 Err(e) => {
@@ -250,11 +174,11 @@ pub fn initialize(config: &any_stt::SttConfig) -> Result<Box<dyn SttEngine>, Stt
             );
             match engine {
                 Ok(e) => {
-                    eprintln!("initialize: using {:?} backend", selection.backend);
+                    eprintln!("initialize: using {} backend", selection.backend);
                     return Ok(Box::new(e));
                 }
                 Err(e) => {
-                    eprintln!("initialize: {:?} failed ({e}), falling back to CPU",
+                    eprintln!("initialize: {} failed ({e}), falling back to CPU",
                         selection.backend);
                 }
             }
@@ -272,6 +196,7 @@ pub fn initialize(config: &any_stt::SttConfig) -> Result<Box<dyn SttEngine>, Stt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CStr;
     use std::path::PathBuf;
 
     fn repo_root() -> PathBuf {

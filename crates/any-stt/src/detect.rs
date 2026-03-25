@@ -183,10 +183,9 @@ fn detect_gpu_sysfs() -> Option<GpuInfo> {
             };
 
             // Try to get VRAM from /sys (AMD exposes this)
-            let vram_mb = entry
-                .path()
-                .join("device/mem_info_vram_total")
-                .pipe(|p| std::fs::read_to_string(p).ok())
+            let vram_path = entry.path().join("device/mem_info_vram_total");
+            let vram_mb = std::fs::read_to_string(vram_path)
+                .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .map(|b| b / (1024 * 1024))
                 .unwrap_or(0);
@@ -201,25 +200,6 @@ fn detect_gpu_sysfs() -> Option<GpuInfo> {
     }
 
     None
-}
-
-/// Helper: allow chaining on Path (for VRAM read)
-#[cfg(target_os = "linux")]
-trait PathPipe {
-    fn pipe<F, R>(self, f: F) -> R
-    where
-        F: FnOnce(Self) -> R,
-        Self: Sized;
-}
-
-#[cfg(target_os = "linux")]
-impl PathPipe for std::path::PathBuf {
-    fn pipe<F, R>(self, f: F) -> R
-    where
-        F: FnOnce(Self) -> R,
-    {
-        f(self)
-    }
 }
 
 /// Try to detect NVIDIA GPU by running nvidia-smi.
