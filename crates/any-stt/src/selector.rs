@@ -41,7 +41,7 @@ fn select_backend(config: &SttConfig, hw: &HardwareInfo) -> Backend {
     // GPU check (second priority).
     if let Some(ref gpu) = hw.gpu {
         match platform {
-            Platform::Linux => {
+            Platform::Linux | Platform::Windows => {
                 if gpu.vendor == GpuVendor::Nvidia {
                     return Backend::Cuda;
                 }
@@ -413,6 +413,45 @@ mod tests {
         );
         let sel = select(&SttConfig::default(), &hw);
         assert_eq!(sel.backend, Backend::Metal);
+    }
+
+    // --- Windows tests ---
+
+    #[test]
+    fn windows_nvidia_selects_cuda() {
+        let hw = make_hw(Platform::Windows, Some(nvidia_gpu(24000)), None, 32000);
+        let config = SttConfig::default();
+        let sel = select(&config, &hw);
+        assert_eq!(sel.backend, Backend::Cuda);
+    }
+
+    #[test]
+    fn windows_no_gpu_selects_cpu() {
+        let hw = make_hw(Platform::Windows, None, None, 16000);
+        let config = SttConfig::default();
+        let sel = select(&config, &hw);
+        assert_eq!(sel.backend, Backend::Cpu);
+    }
+
+    #[test]
+    fn windows_amd_vulkan_allowed() {
+        let hw = make_hw(
+            Platform::Windows,
+            Some(GpuInfo {
+                vendor: GpuVendor::Amd,
+                name: "RX 7900 XTX".into(),
+                vram_mb: 24000,
+                driver: String::new(),
+            }),
+            None,
+            32000,
+        );
+        let config = SttConfig {
+            allow_cold_vulkan: true,
+            ..Default::default()
+        };
+        let sel = select(&config, &hw);
+        assert_eq!(sel.backend, Backend::Vulkan);
     }
 
     #[test]

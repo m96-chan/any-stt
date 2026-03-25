@@ -74,4 +74,5 @@ pub enum Platform {
     MacOs,
     Android,
     Ios,
+    Windows,
 }

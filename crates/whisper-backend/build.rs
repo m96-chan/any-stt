@@ -13,6 +13,7 @@ fn main() {
     let is_android = target.contains("android");
     let is_ios = target.contains("apple-ios");
     let is_macos = target.contains("apple-darwin");
+    let is_windows = target.contains("windows");
     let is_apple = is_ios || is_macos;
     let is_cross = host != target;
 
@@ -80,6 +81,9 @@ fn main() {
     } else if is_macos {
         // macOS: enable OpenMP if available, Accelerate framework
         cfg.define("GGML_OPENMP", "OFF"); // macOS homebrew OpenMP is fragile
+    } else if is_windows {
+        // MSVC OpenMP uses vcomp (incompatible with gomp); disable for simplicity.
+        cfg.define("GGML_OPENMP", "OFF");
     } else {
         // Linux: OpenMP enabled
         cfg.define("GGML_OPENMP", "ON");
@@ -110,7 +114,7 @@ fn main() {
         }
         println!("cargo:rustc-env=WHISPER_LIB_DIR={}", lib_dir.display());
     } else {
-        // Static linking (iOS, macOS, Linux)
+        // Static linking (iOS, macOS, Linux, Windows)
         if lib_dir.exists() {
             println!("cargo:rustc-link-search=native={}", lib_dir.display());
         }
@@ -156,21 +160,37 @@ fn main() {
             println!("cargo:rustc-link-lib=cublasLt");
             println!("cargo:rustc-link-lib=cuda"); // driver API (cuMemAddressFree etc.)
             // CUDA lib paths
-            if let Ok(cuda_home) = env::var("CUDA_HOME") {
-                println!("cargo:rustc-link-search=native={cuda_home}/lib64");
+            if is_windows {
+                // Windows: CUDA_PATH env var + lib\x64
+                if let Ok(cuda_path) = env::var("CUDA_PATH") {
+                    println!("cargo:rustc-link-search=native={cuda_path}\\lib\\x64");
+                }
             } else {
-                println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
-                println!("cargo:rustc-link-search=native=/opt/cuda/lib64");
+                // Linux
+                if let Ok(cuda_home) = env::var("CUDA_HOME") {
+                    println!("cargo:rustc-link-search=native={cuda_home}/lib64");
+                } else {
+                    println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
+                    println!("cargo:rustc-link-search=native=/opt/cuda/lib64");
+                }
+                // NVIDIA driver stub (for libcuda.so)
+                println!("cargo:rustc-link-search=native=/usr/lib64");
+                println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
             }
-            // NVIDIA driver stub (for libcuda.so)
-            println!("cargo:rustc-link-search=native=/usr/lib64");
-            println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
         }
 
         // Vulkan
         if use_vulkan {
             println!("cargo:rustc-link-lib=static=ggml-vulkan");
-            println!("cargo:rustc-link-lib=vulkan");
+            if is_windows {
+                // Windows: vulkan-1.lib (not libvulkan.so)
+                println!("cargo:rustc-link-lib=vulkan-1");
+                if let Ok(vulkan_sdk) = env::var("VULKAN_SDK") {
+                    println!("cargo:rustc-link-search=native={vulkan_sdk}\\Lib");
+                }
+            } else {
+                println!("cargo:rustc-link-lib=vulkan");
+            }
         }
 
         // Platform-specific system libraries
@@ -178,6 +198,8 @@ fn main() {
             println!("cargo:rustc-link-lib=framework=Foundation");
             println!("cargo:rustc-link-lib=framework=Accelerate");
             println!("cargo:rustc-link-lib=c++");
+        } else if is_windows {
+            // MSVC links C++ runtime automatically.
         } else {
             // Linux
             println!("cargo:rustc-link-lib=stdc++");

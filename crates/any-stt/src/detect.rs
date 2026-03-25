@@ -3,10 +3,10 @@ use crate::hardware::{CpuFeature, CpuInfo, HardwareInfo, NpuInfo, OsInfo, Platfo
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use crate::hardware::{GpuInfo, GpuVendor, NpuType};
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
 use crate::hardware::GpuInfo;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::hardware::GpuVendor;
 
 #[cfg(target_os = "android")]
@@ -104,6 +104,15 @@ fn detect_gpu() -> Option<GpuInfo> {
         }
         // Fall back to sysfs for AMD/Intel/other
         if let Some(gpu) = detect_gpu_sysfs() {
+            return Some(gpu);
+        }
+    }
+
+    // Windows: nvidia-smi works on Windows too (C:\Windows\System32\nvidia-smi.exe).
+    // AMD/Intel GPU detection via DXGI deferred to Phase 2.
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(gpu) = detect_nvidia_gpu() {
             return Some(gpu);
         }
     }
@@ -214,7 +223,8 @@ impl PathPipe for std::path::PathBuf {
 }
 
 /// Try to detect NVIDIA GPU by running nvidia-smi.
-#[cfg(target_os = "linux")]
+/// Works on both Linux and Windows (nvidia-smi is on PATH with NVIDIA drivers).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn detect_nvidia_gpu() -> Option<GpuInfo> {
     let output = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"])
@@ -286,7 +296,9 @@ fn detect_qnn_htp_available() -> bool {
 }
 
 fn detect_os() -> OsInfo {
-    let platform = if cfg!(target_os = "macos") {
+    let platform = if cfg!(target_os = "windows") {
+        Platform::Windows
+    } else if cfg!(target_os = "macos") {
         Platform::MacOs
     } else if cfg!(target_os = "ios") {
         Platform::Ios
@@ -302,6 +314,25 @@ fn detect_os() -> OsInfo {
 }
 
 fn detect_os_version() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        // `cmd /C ver` outputs e.g. "Microsoft Windows [Version 10.0.22631.4890]"
+        if let Ok(output) = std::process::Command::new("cmd")
+            .args(["/C", "ver"])
+            .output()
+        {
+            if output.status.success() {
+                let s = String::from_utf8_lossy(&output.stdout);
+                if let Some(start) = s.find('[') {
+                    if let Some(end) = s.find(']') {
+                        return s[start + 1..end].to_string();
+                    }
+                }
+                return s.trim().to_string();
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     {
         // Try /etc/os-release first.
@@ -330,6 +361,13 @@ fn detect_os_version() -> String {
 }
 
 fn detect_available_ram_mb() -> u64 {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(ram) = detect_available_ram_windows() {
+            return ram;
+        }
+    }
+
     #[cfg(target_os = "linux")]
     {
         if let Some(ram) = detect_available_ram_linux() {
@@ -377,6 +415,46 @@ fn detect_available_ram_apple() -> Option<u64> {
     Some(bytes / (1024 * 1024))
 }
 
+/// Detect available RAM on Windows via GlobalMemoryStatusEx.
+#[cfg(target_os = "windows")]
+fn detect_available_ram_windows() -> Option<u64> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        dw_length: u32,
+        dw_memory_load: u32,
+        ull_total_phys: u64,
+        ull_avail_phys: u64,
+        ull_total_page_file: u64,
+        ull_avail_page_file: u64,
+        ull_total_virtual: u64,
+        ull_avail_virtual: u64,
+        ull_avail_extended_virtual: u64,
+    }
+
+    extern "system" {
+        fn GlobalMemoryStatusEx(lpBuffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    let mut status = MemoryStatusEx {
+        dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        dw_memory_load: 0,
+        ull_total_phys: 0,
+        ull_avail_phys: 0,
+        ull_total_page_file: 0,
+        ull_avail_page_file: 0,
+        ull_total_virtual: 0,
+        ull_avail_virtual: 0,
+        ull_avail_extended_virtual: 0,
+    };
+
+    let ret = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ret != 0 {
+        Some(status.ull_avail_phys / (1024 * 1024))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +488,9 @@ mod tests {
         }
         if cfg!(target_os = "macos") {
             assert_eq!(os.platform, Platform::MacOs);
+        }
+        if cfg!(target_os = "windows") {
+            assert_eq!(os.platform, Platform::Windows);
         }
     }
 }
