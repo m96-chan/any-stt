@@ -1,12 +1,17 @@
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
+
+/// Pinned whisper.cpp commit (m96-chan fork with encoder output injection API).
+const WHISPER_CPP_REPO: &str = "https://github.com/m96-chan/whisper.cpp.git";
+const WHISPER_CPP_REV: &str = "458ba53d";
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let whisper_dir = manifest_dir
-        .join("../../third-party/whisper.cpp")
-        .canonicalize()
-        .expect("third-party/whisper.cpp not found — did you init the submodule?");
+
+    // Try submodule path first (git checkout), then fall back to fetching
+    // source automatically (crates.io install).
+    let whisper_dir = resolve_whisper_source(&manifest_dir);
 
     let target = env::var("TARGET").unwrap_or_default();
     let host = env::var("HOST").unwrap_or_default();
@@ -245,4 +250,58 @@ fn build_android_shim(
             .expect("failed to compile shim.so");
         assert!(status.success(), "shim.so compilation failed");
     }
+}
+
+/// Resolve the whisper.cpp source directory.
+///
+/// 1. If the git submodule exists (`../../third-party/whisper.cpp`), use it.
+/// 2. Otherwise, clone the pinned commit into `OUT_DIR/whisper.cpp` (crates.io).
+fn resolve_whisper_source(manifest_dir: &PathBuf) -> PathBuf {
+    // Check submodule path (works in git checkout)
+    let submodule_dir = manifest_dir.join("../../third-party/whisper.cpp");
+    if submodule_dir.join("CMakeLists.txt").exists() {
+        return submodule_dir.canonicalize().unwrap();
+    }
+
+    // crates.io: fetch source into OUT_DIR
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let clone_dir = out_dir.join("whisper.cpp");
+
+    if clone_dir.join("CMakeLists.txt").exists() {
+        return clone_dir;
+    }
+
+    eprintln!(
+        "whisper.cpp submodule not found — cloning {} @ {}",
+        WHISPER_CPP_REPO, WHISPER_CPP_REV
+    );
+
+    let status = Command::new("git")
+        .args([
+            "clone",
+            "--depth", "1",
+            "--single-branch",
+            WHISPER_CPP_REPO,
+            clone_dir.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to run git — is git installed?");
+    assert!(status.success(), "git clone failed");
+
+    // Fetch the exact commit if shallow clone HEAD differs
+    let status = Command::new("git")
+        .current_dir(&clone_dir)
+        .args(["fetch", "--depth", "1", "origin", WHISPER_CPP_REV])
+        .status()
+        .expect("git fetch failed");
+    if status.success() {
+        let status = Command::new("git")
+            .current_dir(&clone_dir)
+            .args(["checkout", WHISPER_CPP_REV])
+            .status()
+            .expect("git checkout failed");
+        assert!(status.success(), "git checkout failed");
+    }
+
+    clone_dir
 }

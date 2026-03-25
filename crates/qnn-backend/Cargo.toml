@@ -1,7 +1,14 @@
 [package]
 name = "qnn-backend"
-version = "0.1.0"
-edition = "2021"
+description = "Qualcomm QNN HTP (Hexagon NPU) backend for any-stt — dlopen loader, graph builder, INT8 encoder"
+readme = "../../README.md"
+keywords = ["qualcomm", "qnn", "npu", "hexagon", "inference"]
+categories = ["multimedia::audio", "api-bindings"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 [dependencies]
 libloading = "0.8"

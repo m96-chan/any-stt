@@ -1,13 +1,20 @@
 [package]
 name = "whisper-backend"
-version = "0.1.0"
-edition = "2021"
+description = "whisper.cpp FFI backend for any-stt — CPU, CUDA, Vulkan, Metal, CoreML, QNN"
+readme = "../../README.md"
+keywords = ["whisper", "speech-to-text", "ffi", "cuda", "metal"]
+categories = ["multimedia::audio", "api-bindings"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 [dependencies]
-any-stt = { path = "../any-stt" }
-gguf-loader = { path = "../gguf-loader" }
+any-stt = { version = "0.1.0", path = "../any-stt" }
+gguf-loader = { version = "0.1.0", path = "../gguf-loader" }
 libloading = "0.8"
-qnn-backend = { path = "../qnn-backend" }
+qnn-backend = { version = "0.1.0", path = "../qnn-backend" }
 
 [dev-dependencies]
 hound = "3"

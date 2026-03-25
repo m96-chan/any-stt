@@ -1,3 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/any-stt", "crates/whisper-backend", "crates/qnn-backend", "crates/gguf-loader", "crates/bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/m96-chan/any-stt"
+authors = ["m96-chan <me.m96-chan.dev>"]

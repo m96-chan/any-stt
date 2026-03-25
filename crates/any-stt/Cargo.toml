@@ -1,11 +1,17 @@
 [package]
 name = "any-stt"
-version = "0.1.0"
-edition = "2021"
+description = "Cross-platform speech-to-text engine — auto-detects hardware and selects the optimal backend"
+readme = "../../README.md"
+keywords = ["stt", "speech-to-text", "whisper", "asr", "transcription"]
+categories = ["multimedia::audio"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 [dependencies]
 thiserror = "2"
-
 
 [features]
 cuda = []
