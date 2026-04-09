@@ -18,7 +18,9 @@ use crate::types::*;
 /// Max layers to keep compiled simultaneously (memory limit).
 /// Each compiled layer ≈ 30-60MB for large models (2 graphs × 15-30MB).
 /// 8 layers × 60MB = ~480MB — fits alongside whisper.cpp model (537MB).
-const CHUNK_SIZE: u32 = 8;
+/// Layers compiled simultaneously. Lower = less memory, more recompilation.
+/// 4 layers × 2 graphs × ~30MB = ~240MB — fits alongside whisper.cpp model.
+const CHUNK_SIZE: u32 = 4;
 
 /// Whisper encoder that runs on NNAPI NPU + CPU attention.
 ///
