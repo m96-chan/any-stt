@@ -204,7 +204,7 @@ fn execute_layer(
     let k = &qkv_results[1];
     let v = &qkv_results[2];
 
-    // CPU: Attention
+    // CPU: Attention (multi-head)
     let scale = 1.0 / (head_dim as f32).sqrt();
     let attn_out = cpu_attention(q, k, v, nc, ns, scale);
 
