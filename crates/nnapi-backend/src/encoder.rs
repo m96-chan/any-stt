@@ -204,23 +204,33 @@ fn execute_layer(
     let k = &qkv_results[1];
     let v = &qkv_results[2];
 
-    // CPU: Attention (multi-head)
+    // CPU: Multi-head attention
     let scale = 1.0 / (head_dim as f32).sqrt();
     let attn_out = cpu_attention(q, k, v, nc, ns, scale);
 
-    if layer_idx < 2 {
-        eprintln!("  L{layer_idx} Q[0..4]: {:.4?}", &q[..4.min(q.len())]);
-        eprintln!("  L{layer_idx} attn[0..4]: {:.4?}", &attn_out[..4.min(attn_out.len())]);
-    }
-
     // Graph B: output proj + residual + LN + FFN (NPU)
+    // Inputs: (0: attn_out, 1: residual=current)
     let ffn_results = layer.ffn_graph.execute(
         &[(0, &attn_out), (1, current)],
         &[(0, out_bytes)],
     ).map_err(|e| format!("layer {layer_idx} ffn: {e}"))?;
 
-    ffn_results.into_iter().next()
-        .ok_or_else(|| format!("layer {layer_idx}: no output"))
+    let output = ffn_results.into_iter().next()
+        .ok_or_else(|| format!("layer {layer_idx}: no output"))?;
+
+    if layer_idx < 4 {
+        eprintln!("  L{layer_idx} out[0..4]: {:.4?}", &output[..4.min(output.len())]);
+    }
+    // Dump layer outputs for offline comparison
+    if layer_idx < 4 {
+        let path = format!("/data/local/tmp/any-stt/layer{layer_idx}_output.bin");
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(output.as_ptr() as *const u8, output.len() * 4)
+        };
+        let _ = std::fs::write(&path, bytes);
+    }
+
+    Ok(output)
 }
 
 /// Multi-head CPU attention: split Q/K/V into heads, attend per head, concatenate.
