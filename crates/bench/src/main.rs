@@ -535,11 +535,16 @@ fn bench_e2e_npu(
 
     let hw = any_stt::detect_hardware();
 
-    // Step 1: Load model via whisper.cpp (this loads all weights internally)
-    eprintln!("  loading model...");
-    let engine = WhisperEngine::new(model_path, lang, Backend::Cpu, hw.clone())
-        .map_err(|e| format!("{e}"))?;
-    let ctx = engine.raw_ctx();
+    // Step 1: Load model with flash_attn=false (NNAPI attention is non-padded)
+    eprintln!("  loading model (flash_attn=false)...");
+    let mut cparams = unsafe { whisper_context_default_params() };
+    cparams.use_gpu = false;
+    cparams.flash_attn = false;
+    let model_c = CString::new(model_path.to_str().unwrap()).unwrap();
+    let ctx = unsafe { whisper_init_from_file_with_params(model_c.as_ptr(), cparams) };
+    if ctx.is_null() {
+        return Err("model load failed".into());
+    }
 
     // Get model dimensions
     let n_state = unsafe { whisper_model_n_audio_state(ctx) } as u32;
@@ -585,10 +590,34 @@ fn bench_e2e_npu(
         &nnapi_lib, device, n_state, n_head, n_layer, n_ctx, weights_fn,
     ).map_err(|e| format!("NNAPI build: {e}"))?;
 
-    // Step 3: CPU reference
+    // Step 3: CPU reference (using same context with flash_attn=false)
     eprintln!("  CPU reference...");
-    let cpu_result = engine.transcribe(audio).map_err(|e| format!("{e}"))?;
-    eprintln!("  CPU: \"{}\" ({:.0}ms)", cpu_result.text.trim(), cpu_result.duration_ms);
+    let cpu_start = Instant::now();
+    {
+        let lang_c = CString::new(lang).unwrap();
+        let params = unsafe { shim_default_params(WhisperSamplingStrategy::Greedy) };
+        unsafe {
+            shim_params_set_language(params, lang_c.as_ptr());
+            shim_params_set_n_threads(params, 8);
+            shim_params_set_translate(params, false);
+            shim_params_set_print_special(params, false);
+            shim_params_set_print_progress(params, false);
+            shim_params_set_print_realtime(params, false);
+            shim_params_set_print_timestamps(params, false);
+            shim_params_set_single_segment(params, false);
+            shim_params_set_suppress_nst(params, true);
+        }
+        let ret = unsafe { shim_whisper_full(ctx, params, audio.as_ptr(), audio.len() as i32) };
+        unsafe { shim_free_params(params) };
+    }
+    let cpu_ms = cpu_start.elapsed().as_secs_f64() * 1000.0;
+    let n_seg = unsafe { whisper_full_n_segments(ctx) };
+    let mut cpu_text = String::new();
+    for s in 0..n_seg {
+        let seg = unsafe { whisper_full_get_segment_text(ctx, s) };
+        if !seg.is_null() { cpu_text.push_str(&unsafe { CStr::from_ptr(seg) }.to_string_lossy()); }
+    }
+    eprintln!("  CPU: \"{}\" ({:.0}ms)", cpu_text.trim(), cpu_ms);
 
     // Step 4: True E2E with NNAPI encoder via callback
     // whisper_full will call our callback after conv preprocessing (mel→conv→gelu→pos_embed).
@@ -600,8 +629,9 @@ fn bench_e2e_npu(
     // Pack encoder reference into a Box for the C callback
     struct EncoderCtx {
         encoder: *mut nnapi_backend::WhisperEncoderNnapi,
+        ctx: *mut WhisperContext,
     }
-    let mut encoder_ctx = EncoderCtx { encoder: &mut nnapi_encoder };
+    let mut encoder_ctx = EncoderCtx { encoder: &mut nnapi_encoder, ctx };
 
     unsafe extern "C" fn encoder_callback(
         conv_output: *const std::os::raw::c_float,
@@ -614,15 +644,68 @@ fn bench_e2e_npu(
         let encoder = &mut *ectx.encoder;
         let len = (n_ctx * n_state) as usize;
 
-        // ggml layout: ne[0]=n_state (innermost), ne[1]=n_ctx → row-major [n_ctx, n_state]
-        // NNAPI encoder expects [n_ctx, n_state] — same layout, no transpose needed
+        // conv_output is already transposed to [n_ctx, n_state] by whisper.cpp callback
         let input = std::slice::from_raw_parts(conv_output, len);
 
-        eprintln!("    callback: n_ctx={}, n_state={}, len={len}", n_ctx, n_state);
+        // Debug: compare NNAPI L0 Q with CPU reference
+        if let Ok(q0) = encoder.debug_layer0_q(input) {
+            // CPU LayerNorm + FC(query) for comparison
+            let nc = n_ctx as usize;
+            let ns = n_state as usize;
+            let name_ln_w = std::ffi::CString::new("encoder.blocks.0.attn_ln.weight").unwrap();
+            let name_ln_b = std::ffi::CString::new("encoder.blocks.0.attn_ln.bias").unwrap();
+            let name_q_w = std::ffi::CString::new("encoder.blocks.0.attn.query.weight").unwrap();
+            let name_q_b = std::ffi::CString::new("encoder.blocks.0.attn.query.bias").unwrap();
+            let get_w = |name: &std::ffi::CString| -> Vec<f32> {
+                let n = whisper_get_model_tensor_f32(ectx.ctx, name.as_ptr(), std::ptr::null_mut(), 0);
+                let mut d = vec![0f32; n as usize]; whisper_get_model_tensor_f32(ectx.ctx, name.as_ptr(), d.as_mut_ptr(), n); d
+            };
+            let ln_w = get_w(&name_ln_w);
+            let ln_b = get_w(&name_ln_b);
+            let q_w = get_w(&name_q_w);
+            let q_b = get_w(&name_q_b);
+
+            // CPU LN
+            let mut ln_out = vec![0f32; nc*ns];
+            for i in 0..nc {
+                let row = &input[i*ns..(i+1)*ns];
+                let mean: f32 = row.iter().sum::<f32>() / ns as f32;
+                let var: f32 = row.iter().map(|x| (x-mean)*(x-mean)).sum::<f32>() / ns as f32;
+                let inv_std = 1.0 / (var + 1e-5f32).sqrt();
+                for j in 0..ns {
+                    ln_out[i*ns+j] = ln_w[j] * (row[j] - mean) * inv_std + ln_b[j];
+                }
+            }
+            // CPU FC(Q)
+            let mut cpu_q = vec![0f32; nc*ns];
+            for i in 0..nc {
+                for j in 0..ns {
+                    let mut s = q_b[j];
+                    for k in 0..ns { s += ln_out[i*ns+k] * q_w[j*ns+k]; }
+                    cpu_q[i*ns+j] = s;
+                }
+            }
+            // Compare
+            let mut max_err: f32 = 0.0;
+            for i in 0..(nc*ns) {
+                let e = (q0[i] - cpu_q[i]).abs();
+                if e > max_err { max_err = e; }
+            }
+            eprintln!("    NNAPI Q[0..4]: {:.4?}", &q0[..4]);
+            eprintln!("    CPU   Q[0..4]: {:.4?}", &cpu_q[..4]);
+            eprintln!("    Q max_err: {:.6} {}", max_err, if max_err < 0.01 { "OK" } else { "FAIL" });
+        }
+
         match encoder.execute(input) {
             Ok(result) => {
-                // Same layout — direct copy
+                // Log first few values for debugging
+                eprintln!("    NPU out[0..4]: {:.4?}", &result[..4.min(len)]);
+                // Encoder output → embd_enc [n_ctx, n_state] row-major
                 std::ptr::copy_nonoverlapping(result.as_ptr(), encoder_output, len);
+
+                // Also log what CPU encoder produces for comparison
+                let cpu_enc = std::slice::from_raw_parts(encoder_output, len);
+                eprintln!("    written[0..4]: {:.4?}", &cpu_enc[..4.min(len)]);
                 0
             }
             Err(e) => {
@@ -685,10 +768,13 @@ fn bench_e2e_npu(
         }
     }
 
-    // Unregister callback
-    unsafe { whisper_set_external_encoder(ctx, None, std::ptr::null_mut()) };
+    // Unregister callback and cleanup
+    unsafe {
+        whisper_set_external_encoder(ctx, None, std::ptr::null_mut());
+        whisper_free(ctx);
+    }
 
-    let match_ok = cpu_result.text.trim() == e2e_text.trim();
+    let match_ok = cpu_text.trim() == e2e_text.trim();
     eprintln!("  text match: {}", if match_ok { "OK ✓" } else { "MISMATCH ✗" });
 
     timings.sort_by(|a, b| a.partial_cmp(b).unwrap());

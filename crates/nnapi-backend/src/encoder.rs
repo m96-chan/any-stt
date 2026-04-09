@@ -100,6 +100,21 @@ impl WhisperEncoderNnapi {
         unsafe { &*self.lib }
     }
 
+    /// Debug: Execute Layer 0 QKV graph only, return Q output for comparison.
+    pub fn debug_layer0_q(&self, input: &[f32]) -> Result<Vec<f32>, String> {
+        let nc = self.n_ctx as usize;
+        let ns = self.n_state as usize;
+        let out_bytes = nc * ns * 4;
+        if self.precompiled.is_empty() {
+            return Err("no precompiled layers".into());
+        }
+        let qkv = self.precompiled[0].qkv_graph.execute(
+            &[(0, input)],
+            &[(0, out_bytes), (1, out_bytes), (2, out_bytes)],
+        )?;
+        Ok(qkv[0].clone())
+    }
+
     /// Execute: input [n_ctx * n_state] → output [n_ctx * n_state].
     pub fn execute(&mut self, input: &[f32]) -> Result<Vec<f32>, String> {
         let nc = self.n_ctx as usize;
@@ -193,6 +208,11 @@ fn execute_layer(
     let scale = 1.0 / (head_dim as f32).sqrt();
     let attn_out = cpu_attention(q, k, v, nc, ns, scale);
 
+    if layer_idx < 2 {
+        eprintln!("  L{layer_idx} Q[0..4]: {:.4?}", &q[..4.min(q.len())]);
+        eprintln!("  L{layer_idx} attn[0..4]: {:.4?}", &attn_out[..4.min(attn_out.len())]);
+    }
+
     // Graph B: output proj + residual + LN + FFN (NPU)
     let ffn_results = layer.ffn_graph.execute(
         &[(0, &attn_out), (1, current)],
@@ -203,12 +223,50 @@ fn execute_layer(
         .ok_or_else(|| format!("layer {layer_idx}: no output"))
 }
 
-/// CPU attention: Q @ K^T * scale → softmax → @ V
+/// Multi-head CPU attention: split Q/K/V into heads, attend per head, concatenate.
 ///
-/// Multi-threaded: parallelizes the outer loop of QK^T and attn@V matmuls
-/// across available CPU cores. V is transposed before the attn@V matmul for
-/// cache-friendly row access.
+/// Q, K, V: [nc, ns] where ns = n_head * head_dim
+/// Output: [nc, ns]
 fn cpu_attention(q: &[f32], k: &[f32], v: &[f32], nc: usize, ns: usize, scale: f32) -> Vec<f32> {
+    // Determine number of heads from scale: scale = 1/sqrt(head_dim)
+    // head_dim = 1/scale^2, n_head = ns / head_dim
+    let head_dim = (1.0 / (scale * scale)).round() as usize;
+    let n_head = ns / head_dim;
+
+    if n_head <= 1 || head_dim * n_head != ns {
+        // Fallback to single-head
+        return cpu_attention_single(q, k, v, nc, ns, scale);
+    }
+
+    // Multi-head: Q[nc, ns] → reshape to [nc, n_head, head_dim] → per-head attention
+    let mut out = vec![0.0f32; nc * ns];
+
+    for h in 0..n_head {
+        let offset = h * head_dim;
+        // Extract head slices: q_h[i] = q[i*ns + offset .. +head_dim]
+        let mut q_h = vec![0.0f32; nc * head_dim];
+        let mut k_h = vec![0.0f32; nc * head_dim];
+        let mut v_h = vec![0.0f32; nc * head_dim];
+        for i in 0..nc {
+            q_h[i * head_dim..(i + 1) * head_dim].copy_from_slice(&q[i * ns + offset..i * ns + offset + head_dim]);
+            k_h[i * head_dim..(i + 1) * head_dim].copy_from_slice(&k[i * ns + offset..i * ns + offset + head_dim]);
+            v_h[i * head_dim..(i + 1) * head_dim].copy_from_slice(&v[i * ns + offset..i * ns + offset + head_dim]);
+        }
+
+        // Single-head attention on this head
+        let head_out = cpu_attention_single(&q_h, &k_h, &v_h, nc, head_dim, scale);
+
+        // Write back to output
+        for i in 0..nc {
+            out[i * ns + offset..i * ns + offset + head_dim].copy_from_slice(&head_out[i * head_dim..(i + 1) * head_dim]);
+        }
+    }
+
+    out
+}
+
+/// Single-head attention: Q @ K^T * scale → softmax → @ V
+fn cpu_attention_single(q: &[f32], k: &[f32], v: &[f32], nc: usize, ns: usize, scale: f32) -> Vec<f32> {
     use std::sync::Arc;
     use std::thread;
 
@@ -546,11 +604,31 @@ fn add_mul_scalar(b: &mut NnapiModelBuilder, input: u32, scalar: f32, m: u32, n:
     add_mul_2d(b, input, s, m, n)
 }
 
+/// GELU ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+/// GPT-2 tanh approximation — more accurate than sigmoid approximation.
 fn add_gelu_approx(b: &mut NnapiModelBuilder, input: u32, m: u32, n: u32) -> Result<u32, String> {
-    let temp = add_mul_scalar(b, input, 1.702, m, n)?;
-    let sig = b.add_tensor_f32(&[m, n])?;
-    b.add_op(ANEURALNETWORKS_LOGISTIC, &[temp], &[sig])?;
-    add_mul_2d(b, input, sig, m, n)
+    let dims = [m, n];
+
+    // x² = x * x
+    let x2 = add_mul_2d(b, input, input, m, n)?;
+    // x³ = x² * x
+    let x3 = add_mul_2d(b, x2, input, m, n)?;
+    // 0.044715 * x³
+    let coeff_x3 = add_mul_scalar(b, x3, 0.044715, m, n)?;
+    // inner = x + 0.044715 * x³
+    let inner = add_add_2d(b, input, coeff_x3, m, n)?;
+    // scaled = sqrt(2/π) * inner ≈ 0.7978846 * inner
+    let scaled = add_mul_scalar(b, inner, 0.7978846, m, n)?;
+    // tanh_out = tanh(scaled)
+    let tanh_out = b.add_tensor_f32(&dims)?;
+    b.add_op(ANEURALNETWORKS_TANH, &[scaled], &[tanh_out])?;
+    // 1 + tanh_out
+    let one = add_weight(b, &[1.0], &[1])?;
+    let one_plus = add_add_2d(b, one, tanh_out, m, n)?;
+    // 0.5 * x
+    let half_x = add_mul_scalar(b, input, 0.5, m, n)?;
+    // gelu = 0.5 * x * (1 + tanh_out)
+    add_mul_2d(b, half_x, one_plus, m, n)
 }
 
 #[allow(dead_code)]
