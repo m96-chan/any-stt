@@ -220,4 +220,23 @@ extern "C" {
         n_past: c_int,
         n_threads: c_int,
     ) -> c_int;
+
+    // --- Model tensor access (for extracting weights to NPU) ---
+
+    /// Get a model tensor dequantized to FP32.
+    /// If out is null, returns the number of elements needed.
+    pub fn whisper_get_model_tensor_f32(
+        ctx: *mut WhisperContext,
+        name: *const c_char,
+        out: *mut c_float,
+        max_elements: c_int,
+    ) -> c_int;
+
+    /// Get a model tensor's shape.
+    pub fn whisper_get_model_tensor_dims(
+        ctx: *mut WhisperContext,
+        name: *const c_char,
+        dims: *mut c_int,
+        max_dims: c_int,
+    ) -> c_int;
 }

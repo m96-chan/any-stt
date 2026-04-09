@@ -107,3 +107,6 @@ int shim_model_n_audio_ctx(struct whisper_context *ctx) {
 int shim_model_n_audio_state(struct whisper_context *ctx) {
     return whisper_model_n_audio_state(ctx);
 }
+
+/* Encoder output injection API — implemented in whisper.cpp directly.
+ * No stubs needed; the functions are linked from libwhisper. */

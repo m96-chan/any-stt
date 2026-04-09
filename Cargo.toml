@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/any-stt", "crates/whisper-backend", "crates/qnn-backend", "crates/gguf-loader", "crates/bench"]
+members = ["crates/any-stt", "crates/whisper-backend", "crates/qnn-backend", "crates/nnapi-backend", "crates/gguf-loader", "crates/bench"]
 
 [workspace.package]
 version = "0.1.0"

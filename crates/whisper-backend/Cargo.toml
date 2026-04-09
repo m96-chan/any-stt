@@ -14,6 +14,7 @@ authors.workspace = true
 any-stt = { version = "0.1.0", path = "../any-stt" }
 gguf-loader = { version = "0.1.0", path = "../gguf-loader" }
 libloading = "0.8"
+nnapi-backend = { version = "0.1.0", path = "../nnapi-backend" }
 qnn-backend = { version = "0.1.0", path = "../qnn-backend" }
 
 [dev-dependencies]

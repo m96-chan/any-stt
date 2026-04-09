@@ -1,6 +1,7 @@
 pub mod decoder;
 pub mod ffi;
 pub mod hybrid;
+pub mod nnapi_hybrid;
 pub mod preprocess;
 pub mod qnn;
 
@@ -81,6 +82,11 @@ impl WhisperEngine {
             language: lang,
             n_threads,
         })
+    }
+
+    /// Get the raw whisper context pointer (for encoder output injection).
+    pub fn raw_ctx(&self) -> *mut WhisperContext {
+        self.ctx
     }
 }
 

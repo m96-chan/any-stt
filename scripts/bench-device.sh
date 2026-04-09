@@ -77,12 +77,18 @@ fi
 
 echo "=== Cross-compile for $TARGET ==="
 
-# Set up Android linker
-NDK_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+# Set up Android linker (detect host OS)
+case "$(uname -s)" in
+    Linux*)  NDK_HOST="linux-x86_64" ;;
+    Darwin*) NDK_HOST="darwin-x86_64" ;;
+    *)       NDK_HOST="linux-x86_64" ;;
+esac
+NDK_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$NDK_HOST"
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_TOOLCHAIN/bin/aarch64-linux-android35-clang"
 export CC_aarch64_linux_android="$NDK_TOOLCHAIN/bin/aarch64-linux-android35-clang"
 export CXX_aarch64_linux_android="$NDK_TOOLCHAIN/bin/aarch64-linux-android35-clang++"
 export AR_aarch64_linux_android="$NDK_TOOLCHAIN/bin/llvm-ar"
+export CMAKE="$(command -v cmake)"
 
 CARGO_ARGS="--release --target $TARGET -p bench"
 if [[ -n "$FEATURES" ]]; then

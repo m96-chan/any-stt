@@ -42,7 +42,8 @@ fn main() {
         .define("GGML_CUDA", if use_cuda { "ON" } else { "OFF" })
         .define("GGML_OPENCL", "OFF")
         .define("GGML_SYCL", "OFF")
-        .define("GGML_RPC", "OFF");
+        .define("GGML_RPC", "OFF")
+        .define("GGML_BLAS", "OFF");
 
     // --- Metal ---
     if use_metal {
@@ -225,7 +226,12 @@ fn build_android_shim(
     lib_dir: &PathBuf,
 ) {
     if let Ok(ndk) = env::var("ANDROID_NDK_HOME") {
-        let ndk_bin = format!("{ndk}/toolchains/llvm/prebuilt/linux-x86_64/bin");
+        let ndk_host = if cfg!(target_os = "macos") {
+            "darwin-x86_64"
+        } else {
+            "linux-x86_64"
+        };
+        let ndk_bin = format!("{ndk}/toolchains/llvm/prebuilt/{ndk_host}/bin");
         let cc = format!("{ndk_bin}/aarch64-linux-android35-clang");
 
         let include_dir = dst.join("include");

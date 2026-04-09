@@ -37,20 +37,24 @@ pub trait SttEngine: Send + Sync {
 ///
 /// Returns a boxed [`SttEngine`] ready to transcribe audio.
 ///
-/// On Snapdragon devices with QNN HTP, attempts to build a hybrid CPU+NPU
-/// engine. Falls back to CPU-only whisper.cpp if QNN is unavailable.
+/// On Snapdragon devices with QNN HTP, uses WhisperQnnEngine (Hexagon DSP).
+/// On MediaTek Dimensity / other Android, uses WhisperNnapiEngine (NeuroPilot).
+/// Falls back to CPU-only whisper.cpp if no NPU is available.
 pub fn initialize(config: SttConfig) -> Result<Box<dyn SttEngine>, SttError> {
     let hw = detect::detect_hardware();
     let selection = selector::select(&config, &hw);
 
     match selection.backend {
         Backend::Qnn => {
-            // QNN backend selected — the caller (whisper-backend) must
-            // construct WhisperQnnEngine with the appropriate model paths.
-            // This function serves as the dispatch point; the actual
-            // construction is done by the whisper-backend crate.
+            // Snapdragon: QNN HTP (Hexagon DSP) — use WhisperQnnEngine
             Err(SttError::NotImplemented(
                 "QNN backend selected — use whisper_backend::hybrid::WhisperQnnEngine::new() directly".into(),
+            ))
+        }
+        Backend::Nnapi => {
+            // MediaTek / generic Android: NNAPI (NeuroPilot) — use WhisperNnapiEngine
+            Err(SttError::NotImplemented(
+                "NNAPI backend selected — use whisper_backend::nnapi_hybrid::WhisperNnapiEngine::new() directly".into(),
             ))
         }
         Backend::Cpu => {

@@ -16,6 +16,7 @@ dependencies = [
  "any-stt",
  "gguf-loader",
  "hound",
+ "nnapi-backend",
  "qnn-backend",
  "whisper-backend",
 ]
@@ -99,6 +100,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "nnapi-backend"
+version = "0.1.0"
+dependencies = [
+ "libloading",
 ]
 
 [[package]]
@@ -222,6 +230,7 @@ dependencies = [
  "gguf-loader",
  "hound",
  "libloading",
+ "nnapi-backend",
  "qnn-backend",
  "serde",
  "serde_json",

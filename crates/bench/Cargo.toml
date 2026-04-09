@@ -12,6 +12,7 @@ path = "src/main.rs"
 any-stt = { path = "../any-stt" }
 whisper-backend = { path = "../whisper-backend" }
 qnn-backend = { path = "../qnn-backend" }
+nnapi-backend = { path = "../nnapi-backend" }
 gguf-loader = { path = "../gguf-loader" }
 hound = "3"
 
