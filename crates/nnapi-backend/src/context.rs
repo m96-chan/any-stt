@@ -287,11 +287,14 @@ impl NnapiModelBuilder {
         }
         eprintln!("NNAPI: compilation done");
 
+        // Free weight data after compilation to save memory.
+        // The compiled model is self-contained (verified on mtk-neuron_shim).
+        drop(self._owned_data);
+
         Ok(NnapiCompiled {
             lib: self.lib,
             _model: self.model,
             compilation,
-            _owned_data: self._owned_data,
         })
     }
 }
@@ -301,7 +304,6 @@ pub struct NnapiCompiled {
     lib: *const NnapiLib,
     _model: *mut ANeuralNetworksModel,
     compilation: *mut ANeuralNetworksCompilation,
-    _owned_data: Vec<Vec<u8>>,
 }
 
 // SAFETY: NNAPI handles are thread-safe for non-concurrent execution.

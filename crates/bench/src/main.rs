@@ -691,18 +691,54 @@ fn bench_e2e_npu(
     let ns = n_state as usize; // 384
     let conv_raw_ne0 = nc; // ne[0] of embd_conv = n_ctx = 1500
 
+    // whisper.cpp encoder does: transpose(embd_conv) + positional_embedding
+    // embd_conv: [ne0=n_ctx, ne1=n_state] → transpose → [ne0=n_state, ne1=n_ctx]
+    // which is row-major [n_ctx, n_state] — matching our NNAPI layout.
+    // We must also add positional_embedding before passing to NNAPI.
     let conv_input: Vec<f32> = if !conv_ptr.is_null() {
         let raw = unsafe { std::slice::from_raw_parts(conv_ptr, nc * ns) };
+        // Transpose: raw is [n_state rows × n_ctx cols] (ne[1]=n_state, ne[0]=n_ctx)
+        // → transposed [n_ctx rows × n_state cols]
+        let conv_raw_ne0 = nc; // ne[0] = n_ctx = 1500
         let mut transposed = vec![0.0f32; nc * ns];
         for ctx_i in 0..nc {
             for state_i in 0..ns {
                 transposed[ctx_i * ns + state_i] = raw[state_i * conv_raw_ne0 + ctx_i];
             }
         }
+        // Add positional embedding
+        let pe_name = CString::new("encoder.positional_embedding").unwrap();
+        let pe_n = unsafe { whisper_get_model_tensor_f32(ctx, pe_name.as_ptr(), std::ptr::null_mut(), 0) };
+        if pe_n > 0 {
+            let mut pe = vec![0.0f32; pe_n as usize];
+            unsafe { whisper_get_model_tensor_f32(ctx, pe_name.as_ptr(), pe.as_mut_ptr(), pe_n) };
+            // pe shape: [n_state, n_ctx] in ggml → row-major [n_ctx, n_state]
+            // Same layout as transposed conv → element-wise add
+            let add_len = (pe_n as usize).min(nc * ns);
+            for i in 0..add_len {
+                transposed[i] += pe[i];
+            }
+            eprintln!("  added positional embedding ({} floats)", pe_n);
+        }
         transposed
     } else {
         return Err("conv output not available".into());
     };
+
+    eprintln!("  conv_input[0..4]: {:.4?}", &conv_input[..4.min(conv_input.len())]);
+    // Compare: whisper.cpp CPU encoder output
+    let mut enc_nc: i32 = 0;
+    let mut enc_ns: i32 = 0;
+    let enc_ptr = unsafe { whisper_get_encoder_output(ctx, &mut enc_nc, &mut enc_ns) };
+    if !enc_ptr.is_null() {
+        let enc_data = unsafe { std::slice::from_raw_parts(enc_ptr, (enc_nc * enc_ns) as usize) };
+        eprintln!("  CPU enc[0..4]: {:.4?}", &enc_data[..4]);
+    }
+    // Dump for C debug comparison
+    unsafe {
+        let bytes = std::slice::from_raw_parts(conv_input.as_ptr() as *const u8, conv_input.len() * 4);
+        let _ = std::fs::write("/data/local/tmp/any-stt/conv_output.bin", bytes);
+    }
 
     // Run NNAPI encoder on conv output
     eprintln!("  running NNAPI encoder...");
