@@ -585,57 +585,68 @@ fn bench_e2e_npu(
         &nnapi_lib, device, n_state, n_head, n_layer, n_ctx, weights_fn,
     ).map_err(|e| format!("NNAPI build: {e}"))?;
 
-    // Step 3: Run CPU full pipeline to get encoder output (for inject)
-    eprintln!("  running CPU full pipeline...");
+    // Step 3: CPU reference
+    eprintln!("  CPU reference...");
     let cpu_result = engine.transcribe(audio).map_err(|e| format!("{e}"))?;
     eprintln!("  CPU: \"{}\" ({:.0}ms)", cpu_result.text.trim(), cpu_result.duration_ms);
 
-    let enc_n_ctx = n_ctx as i32;
-    let enc_n_state = n_state as i32;
+    // Step 4: True E2E with NNAPI encoder via callback
+    // whisper_full will call our callback after conv preprocessing (mel→conv→gelu→pos_embed).
+    // The callback runs the NNAPI encoder on conv output and writes encoder output.
+    // Then whisper.cpp continues with cross-attention + decoder.
+    //
+    // Flow: mel(CPU) → conv(CPU) → NNAPI_encoder(NPU+CPU) → cross(CPU) → decode(CPU)
 
-    // Step 4: E2E with NPU encoder
-    // Flow per run:
-    //   a) whisper_encode (CPU, skip_encode=false) to compute mel+conv (encoder input)
-    //   b) Read conv output → run NNAPI encoder → get encoder output
-    //   c) Inject encoder output via whisper_set_encoder_output
-    //   d) whisper_full (skip_encode=true) to decode using injected encoder output
-    eprintln!("  E2E NPU run...");
+    // Pack encoder reference into a Box for the C callback
+    struct EncoderCtx {
+        encoder: *mut nnapi_backend::WhisperEncoderNnapi,
+    }
+    let mut encoder_ctx = EncoderCtx { encoder: &mut nnapi_encoder };
+
+    unsafe extern "C" fn encoder_callback(
+        conv_output: *const std::os::raw::c_float,
+        encoder_output: *mut std::os::raw::c_float,
+        n_ctx: std::os::raw::c_int,
+        n_state: std::os::raw::c_int,
+        user_data: *mut std::os::raw::c_void,
+    ) -> std::os::raw::c_int {
+        let ectx = &mut *(user_data as *mut EncoderCtx);
+        let encoder = &mut *ectx.encoder;
+        let len = (n_ctx * n_state) as usize;
+
+        // ggml layout: ne[0]=n_state (innermost), ne[1]=n_ctx → row-major [n_ctx, n_state]
+        // NNAPI encoder expects [n_ctx, n_state] — same layout, no transpose needed
+        let input = std::slice::from_raw_parts(conv_output, len);
+
+        eprintln!("    callback: n_ctx={}, n_state={}, len={len}", n_ctx, n_state);
+        match encoder.execute(input) {
+            Ok(result) => {
+                // Same layout — direct copy
+                std::ptr::copy_nonoverlapping(result.as_ptr(), encoder_output, len);
+                0
+            }
+            Err(e) => {
+                eprintln!("    NNAPI encoder failed: {e}");
+                -1
+            }
+        }
+    }
+
+    // Register callback
+    unsafe {
+        whisper_set_external_encoder(
+            ctx,
+            Some(encoder_callback),
+            &mut encoder_ctx as *mut EncoderCtx as *mut std::os::raw::c_void,
+        );
+    }
+
+    eprintln!("  E2E NPU run (via callback)...");
     let mut timings = Vec::with_capacity(runs);
     let mut e2e_text = String::new();
 
     for i in 0..runs {
         let start = Instant::now();
-
-        // 4a: Run whisper_full with skip_encode=true
-        //     This runs mel+conv preprocessing and cross-attention KV setup + decode.
-        //     Before running, inject encoder output so the decoder uses NPU results.
-        //
-        //     For first iteration: we use CPU encoder output (from step 3) as encoder input
-        //     is already computed. In production, we'd run whisper_encode for just conv,
-        //     then NNAPI encoder, then inject.
-        //
-        //     Here: use the CPU encoder output to demonstrate the inject pipeline works
-        //     at full 32-layer scale. The timing excludes encoder time since we're
-        //     measuring decoder + inject overhead.
-
-        // Read CPU encoder output (computed in step 3)
-        let enc_ptr = unsafe { whisper_get_encoder_output(ctx, std::ptr::null_mut(), std::ptr::null_mut()) };
-        if enc_ptr.is_null() {
-            return Err("encoder output null".into());
-        }
-        let enc_len = (enc_n_ctx * enc_n_state) as usize;
-        let enc_data: Vec<f32> = unsafe { std::slice::from_raw_parts(enc_ptr, enc_len) }.to_vec();
-
-        // Run NNAPI encoder on the conv output (= CPU's encoder input)
-        // Note: skip for now — we inject CPU encoder output to validate pipeline.
-        // When NNAPI encoder produces correct output, switch to:
-        //   let npu_out = nnapi_encoder.execute(&conv_data)?;
-
-        // Inject encoder output and run decode-only
-        unsafe {
-            whisper_set_encoder_output(ctx, enc_data.as_ptr(), enc_n_ctx, enc_n_state);
-            whisper_set_skip_encode(ctx, true);
-        }
 
         let lang_c = CString::new(lang).unwrap();
         let params = unsafe { shim_default_params(WhisperSamplingStrategy::Greedy) };
@@ -651,9 +662,9 @@ fn bench_e2e_npu(
             shim_params_set_suppress_nst(params, true);
         }
 
+        // whisper_full runs: mel → conv → (callback: NNAPI encoder) → cross → decode
         let ret = unsafe { shim_whisper_full(ctx, params, audio.as_ptr(), audio.len() as i32) };
         unsafe { shim_free_params(params) };
-        unsafe { whisper_set_skip_encode(ctx, false) };
 
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         timings.push(ms);
@@ -674,13 +685,17 @@ fn bench_e2e_npu(
         }
     }
 
+    // Unregister callback
+    unsafe { whisper_set_external_encoder(ctx, None, std::ptr::null_mut()) };
+
     let match_ok = cpu_result.text.trim() == e2e_text.trim();
     eprintln!("  text match: {}", if match_ok { "OK ✓" } else { "MISMATCH ✗" });
 
     timings.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
+    let total_layers = unsafe { whisper_model_n_audio_layer(ctx) };
     Ok(BenchResult {
-        label: format!("E2E NPU ({}L)", unsafe { whisper_model_n_audio_layer(ctx) }),
+        label: format!("E2E NPU ({}L)", total_layers),
         median_ms: timings[timings.len() / 2],
         min_ms: timings[0],
         max_ms: *timings.last().unwrap(),

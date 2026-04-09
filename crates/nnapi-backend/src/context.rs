@@ -287,23 +287,21 @@ impl NnapiModelBuilder {
         }
         eprintln!("NNAPI: compilation done");
 
-        // After compilation_finish, the compiled artifact is self-contained.
-        // Free the model and weight data to reclaim memory (~78MB per large layer).
-        unsafe { (lib.model_free)(self.model) };
-        drop(self._owned_data);
-
         Ok(NnapiCompiled {
             lib: self.lib,
+            _model: self.model,
             compilation,
+            _owned_data: self._owned_data,
         })
     }
 }
 
 /// A compiled NNAPI model ready for execution.
-/// After compilation, the model and weight data are freed to save memory.
 pub struct NnapiCompiled {
     lib: *const NnapiLib,
+    _model: *mut ANeuralNetworksModel,
     compilation: *mut ANeuralNetworksCompilation,
+    _owned_data: Vec<Vec<u8>>,
 }
 
 // SAFETY: NNAPI handles are thread-safe for non-concurrent execution.
@@ -389,6 +387,7 @@ impl Drop for NnapiCompiled {
         let lib = self.lib();
         unsafe {
             (lib.compilation_free)(self.compilation);
+            (lib.model_free)(self._model);
         }
     }
 }

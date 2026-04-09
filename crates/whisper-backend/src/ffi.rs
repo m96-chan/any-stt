@@ -221,6 +221,22 @@ extern "C" {
         n_threads: c_int,
     ) -> c_int;
 
+    // --- External encoder callback ---
+
+    /// Set an external encoder callback. Called after conv, before cross-attention.
+    /// The callback receives conv output [n_state, n_ctx] and must write encoder output.
+    pub fn whisper_set_external_encoder(
+        ctx: *mut WhisperContext,
+        cb: Option<unsafe extern "C" fn(
+            conv_output: *const c_float,
+            encoder_output: *mut c_float,
+            n_ctx: c_int,
+            n_state: c_int,
+            user_data: *mut c_void,
+        ) -> c_int>,
+        user_data: *mut c_void,
+    );
+
     // --- Model tensor access (for extracting weights to NPU) ---
 
     /// Get a model tensor dequantized to FP32.
