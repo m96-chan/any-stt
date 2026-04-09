@@ -7,23 +7,41 @@
 //!
 //! Uses FULLY_CONNECTED instead of BATCH_MATMUL (not supported on MediaTek NPU).
 //! GELU is approximated as x * sigmoid(1.702 * x).
+//!
+//! Memory strategy: layers are compiled in chunks and freed after execution to
+//! allow 32-layer large models to run within 3GB RAM.
 
 use crate::context::{NnapiCompiled, NnapiModelBuilder};
 use crate::loader::NnapiLib;
 use crate::types::*;
 
-/// Compiled Whisper encoder ready for execution on NNAPI NPU + CPU attention.
+/// Max layers to keep compiled simultaneously (memory limit).
+/// Each compiled layer ≈ 30-60MB for large models (2 graphs × 15-30MB).
+/// 8 layers × 60MB = ~480MB — fits alongside whisper.cpp model (537MB).
+const CHUNK_SIZE: u32 = 8;
+
+/// Whisper encoder that runs on NNAPI NPU + CPU attention.
+///
+/// Instead of pre-compiling all layers, builds and executes in chunks to
+/// avoid OOM on memory-constrained devices.
 pub struct WhisperEncoderNnapi {
-    layers: Vec<EncoderLayer>,
+    /// Reference to the NNAPI library (must outlive this struct).
+    lib: *const NnapiLib,
+    device: *const ANeuralNetworksDevice,
     n_ctx: u32,
     n_state: u32,
     n_head: u32,
+    n_layer: u32,
+    /// Pre-compiled layers (if they fit in memory).
+    precompiled: Vec<EncoderLayer>,
+    /// Weight provider — stored for on-demand compilation.
+    /// None if all layers are precompiled.
+    weight_fn: Option<Box<dyn FnMut(&str) -> Result<Vec<f32>, String>>>,
+    cache_dir: Option<String>,
 }
 
 struct EncoderLayer {
-    /// Graph A: input [n_ctx, n_state] → Q [n_ctx, n_state], K [...], V [...]
     qkv_graph: NnapiCompiled,
-    /// Graph B: attn_out + residual_input → layer output [n_ctx, n_state]
     ffn_graph: NnapiCompiled,
 }
 
@@ -31,7 +49,8 @@ unsafe impl Send for WhisperEncoderNnapi {}
 unsafe impl Sync for WhisperEncoderNnapi {}
 
 impl WhisperEncoderNnapi {
-    /// Build and compile the encoder targeting a specific NNAPI device.
+    /// Build the encoder. Compiles as many layers as fit in memory upfront.
+    /// Remaining layers are compiled on-demand during execution.
     pub fn build<F>(
         lib: &NnapiLib,
         device: *const ANeuralNetworksDevice,
@@ -42,39 +61,47 @@ impl WhisperEncoderNnapi {
         mut weights: F,
     ) -> Result<Self, String>
     where
-        F: FnMut(&str) -> Result<Vec<f32>, String>,
+        F: FnMut(&str) -> Result<Vec<f32>, String> + 'static,
     {
-        // Generate a cache token from model dimensions for NNAPI compilation caching
         let cache_dir = std::env::var("NNAPI_CACHE_DIR").ok();
-        let mut layers = Vec::new();
 
-        for layer_idx in 0..n_layer {
+        // Try to precompile first chunk to verify NNAPI works
+        let first_chunk = CHUNK_SIZE.min(n_layer);
+        let mut precompiled = Vec::new();
+
+        for layer_idx in 0..first_chunk {
             eprintln!("NNAPI: building layer {layer_idx}/{n_layer}...");
             let is_last = layer_idx == n_layer - 1;
-
-            // Per-layer cache token: hash of (n_state, n_head, n_ctx, layer_idx, is_last)
-            let cache_token = cache_dir.as_ref().map(|_| {
-                let mut token = [0u8; 32];
-                let key = format!("whisper_enc_{n_state}_{n_head}_{n_ctx}_{layer_idx}_{is_last}");
-                // Simple hash: copy key bytes cyclically
-                for (i, b) in key.bytes().enumerate() {
-                    token[i % 32] ^= b;
-                }
-                token
-            });
-
-            let layer = build_layer(
-                lib, device, n_state, n_head, n_ctx, layer_idx, is_last, &mut weights,
-                cache_dir.as_deref(), cache_token.as_ref(),
+            let layer = build_layer_with_cache(
+                lib, device, n_state, n_head, n_ctx, layer_idx, is_last,
+                &mut weights, cache_dir.as_deref(),
             )?;
-            layers.push(layer);
+            precompiled.push(layer);
         }
 
-        Ok(Self { layers, n_ctx, n_state, n_head })
+        Ok(Self {
+            lib: lib as *const NnapiLib,
+            device,
+            n_ctx,
+            n_state,
+            n_head,
+            n_layer,
+            precompiled,
+            weight_fn: if first_chunk < n_layer {
+                Some(Box::new(weights))
+            } else {
+                None
+            },
+            cache_dir,
+        })
+    }
+
+    fn lib(&self) -> &NnapiLib {
+        unsafe { &*self.lib }
     }
 
     /// Execute: input [n_ctx * n_state] → output [n_ctx * n_state].
-    pub fn execute(&self, input: &[f32]) -> Result<Vec<f32>, String> {
+    pub fn execute(&mut self, input: &[f32]) -> Result<Vec<f32>, String> {
         let nc = self.n_ctx as usize;
         let ns = self.n_state as usize;
         let nh = self.n_head as usize;
@@ -84,41 +111,96 @@ impl WhisperEncoderNnapi {
             return Err(format!("input length {}, expected {expected}", input.len()));
         }
 
-        let out_bytes = expected * 4;
         let mut current = input.to_vec();
 
-        for (i, layer) in self.layers.iter().enumerate() {
-            // --- Graph A: LayerNorm + QKV projections (NPU) ---
-            // Input: current [n_ctx, n_state]
-            // Outputs: Q [n_ctx, n_state], K [...], V [...]
-            let qkv_out_bytes = nc * ns * 4;
-            let qkv_results = layer.qkv_graph.execute(
-                &[(0, &current)],
-                &[(0, qkv_out_bytes), (1, qkv_out_bytes), (2, qkv_out_bytes)],
-            ).map_err(|e| format!("layer {i} qkv: {e}"))?;
+        // Execute precompiled layers first
+        let precompiled_count = self.precompiled.len() as u32;
+        for (i, layer) in self.precompiled.iter().enumerate() {
+            current = execute_layer(layer, &current, nc, ns, head_dim, i)?;
+        }
 
-            let q = &qkv_results[0];
-            let k = &qkv_results[1];
-            let v = &qkv_results[2];
+        // Execute remaining layers in chunks (on-demand compile → execute → free)
+        if precompiled_count < self.n_layer {
+            let remaining_start = precompiled_count;
+            let remaining_end = self.n_layer;
 
-            // --- CPU: Attention ---
-            // QK^T → scale → softmax → @V
-            let scale = 1.0 / (head_dim as f32).sqrt();
-            let attn_out = cpu_attention(q, k, v, nc, ns, scale);
+            // Take weight_fn out of self to avoid borrow conflicts
+            let mut weight_fn = self.weight_fn.take()
+                .ok_or("weight function unavailable")?;
+            let lib = unsafe { &*self.lib };
+            let device = self.device;
+            let n_state = self.n_state;
+            let n_head = self.n_head;
+            let n_ctx = self.n_ctx;
+            let n_layer = self.n_layer;
+            let cache_dir_ref = self.cache_dir.as_deref();
 
-            // --- Graph B: output proj + residual + LN + FFN + residual (NPU) ---
-            // Inputs: attn_out [n_ctx, n_state], residual (current) [n_ctx, n_state]
-            let ffn_results = layer.ffn_graph.execute(
-                &[(0, &attn_out), (1, &current)],
-                &[(0, out_bytes)],
-            ).map_err(|e| format!("layer {i} ffn: {e}"))?;
+            let mut chunk_start = remaining_start;
+            while chunk_start < remaining_end {
+                let chunk_end = (chunk_start + CHUNK_SIZE).min(remaining_end);
+                eprintln!("NNAPI: compiling layers {chunk_start}..{chunk_end}");
+                let mut chunk_layers = Vec::new();
 
-            current = ffn_results.into_iter().next()
-                .ok_or_else(|| format!("layer {i}: no output"))?;
+                for layer_idx in chunk_start..chunk_end {
+                    let is_last = layer_idx == n_layer - 1;
+                    let wf: &mut dyn FnMut(&str) -> Result<Vec<f32>, String> = &mut *weight_fn;
+                    let layer = build_layer_with_cache(
+                        lib, device, n_state, n_head, n_ctx,
+                        layer_idx, is_last, wf, cache_dir_ref,
+                    )?;
+                    chunk_layers.push(layer);
+                }
+
+                for (j, layer) in chunk_layers.iter().enumerate() {
+                    let abs_idx = (chunk_start + j as u32) as usize;
+                    current = execute_layer(layer, &current, nc, ns, head_dim, abs_idx)?;
+                }
+
+                drop(chunk_layers);
+                chunk_start = chunk_end;
+            }
+
+            // Put weight_fn back
+            self.weight_fn = Some(weight_fn);
         }
 
         Ok(current)
     }
+}
+
+/// Execute a single layer: NPU QKV → CPU attention → NPU FFN.
+fn execute_layer(
+    layer: &EncoderLayer,
+    current: &[f32],
+    nc: usize,
+    ns: usize,
+    head_dim: usize,
+    layer_idx: usize,
+) -> Result<Vec<f32>, String> {
+    let out_bytes = nc * ns * 4;
+
+    // Graph A: LayerNorm + QKV projections (NPU)
+    let qkv_results = layer.qkv_graph.execute(
+        &[(0, current)],
+        &[(0, out_bytes), (1, out_bytes), (2, out_bytes)],
+    ).map_err(|e| format!("layer {layer_idx} qkv: {e}"))?;
+
+    let q = &qkv_results[0];
+    let k = &qkv_results[1];
+    let v = &qkv_results[2];
+
+    // CPU: Attention
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let attn_out = cpu_attention(q, k, v, nc, ns, scale);
+
+    // Graph B: output proj + residual + LN + FFN (NPU)
+    let ffn_results = layer.ffn_graph.execute(
+        &[(0, &attn_out), (1, current)],
+        &[(0, out_bytes)],
+    ).map_err(|e| format!("layer {layer_idx} ffn: {e}"))?;
+
+    ffn_results.into_iter().next()
+        .ok_or_else(|| format!("layer {layer_idx}: no output"))
 }
 
 /// CPU attention: Q @ K^T * scale → softmax → @ V
@@ -135,8 +217,6 @@ fn cpu_attention(q: &[f32], k: &[f32], v: &[f32], nc: usize, ns: usize, scale: f
         .unwrap_or(4);
 
     // --- QK^T: [nc, ns] @ [ns, nc] → [nc, nc], scaled ---
-    // K is stored row-major [nc, ns], so k[j] row = k[j*ns .. (j+1)*ns].
-    // The inner product q_row[d] * k_row[d] is already cache-friendly for both.
     let mut qk = vec![0.0f32; nc * nc];
     {
         let q_arc = Arc::new(q.to_vec());
@@ -148,9 +228,7 @@ fn cpu_attention(q: &[f32], k: &[f32], v: &[f32], nc: usize, ns: usize, scale: f
         for t in 0..n_threads {
             let row_start = t * rows_per_thread;
             let row_end = (row_start + rows_per_thread).min(nc);
-            if row_start >= nc {
-                break;
-            }
+            if row_start >= nc { break; }
             let q_ref = Arc::clone(&q_arc);
             let k_ref = Arc::clone(&k_arc);
             let nc_ = nc;
@@ -182,7 +260,7 @@ fn cpu_attention(q: &[f32], k: &[f32], v: &[f32], nc: usize, ns: usize, scale: f
         }
     }
 
-    // --- Softmax over last dim (already fast, no parallelism needed) ---
+    // --- Softmax over last dim ---
     for i in 0..nc {
         let row = &mut qk[i * nc..(i + 1) * nc];
         let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -197,9 +275,7 @@ fn cpu_attention(q: &[f32], k: &[f32], v: &[f32], nc: usize, ns: usize, scale: f
     }
 
     // --- attn @ V: [nc, nc] @ [nc, ns] → [nc, ns] ---
-    // Transpose V first: V is [nc, ns] row-major → V^T is [ns, nc] row-major.
-    // This lets us access V^T row j (= V column j) contiguously when computing
-    // out[i, j] = sum_t qk[i, t] * V^T[j, t].
+    // Transpose V for cache-friendly access
     let mut vt = vec![0.0f32; ns * nc];
     for r in 0..nc {
         for c in 0..ns {
@@ -218,9 +294,7 @@ fn cpu_attention(q: &[f32], k: &[f32], v: &[f32], nc: usize, ns: usize, scale: f
         for t in 0..n_threads {
             let row_start = t * rows_per_thread;
             let row_end = (row_start + rows_per_thread).min(nc);
-            if row_start >= nc {
-                break;
-            }
+            if row_start >= nc { break; }
             let qk_ref = Arc::clone(&qk_arc);
             let vt_ref = Arc::clone(&vt_arc);
             let nc_ = nc;
@@ -258,7 +332,7 @@ fn cpu_attention(q: &[f32], k: &[f32], v: &[f32], nc: usize, ns: usize, scale: f
 // Graph builders
 // ======================================================================
 
-fn build_layer<F>(
+fn build_layer_with_cache(
     lib: &NnapiLib,
     device: *const ANeuralNetworksDevice,
     n_state: u32,
@@ -266,53 +340,52 @@ fn build_layer<F>(
     n_ctx: u32,
     layer_idx: u32,
     is_last: bool,
-    weights: &mut F,
+    weights: &mut dyn FnMut(&str) -> Result<Vec<f32>, String>,
     cache_dir: Option<&str>,
-    cache_token: Option<&[u8; 32]>,
 ) -> Result<EncoderLayer, String>
-where
-    F: FnMut(&str) -> Result<Vec<f32>, String>,
 {
     let prefix = format!("encoder.blocks.{layer_idx}");
 
-    // QKV cache token variant
-    let qkv_token = cache_token.map(|t| {
-        let mut qt = *t;
-        qt[31] ^= 0xAA; // differentiate from FFN
-        qt
+    let cache_token = cache_dir.map(|_| {
+        let mut token = [0u8; 32];
+        let key = format!("whisper_enc_{n_state}_{_n_head}_{n_ctx}_{layer_idx}_{is_last}");
+        for (i, b) in key.bytes().enumerate() {
+            token[i % 32] ^= b;
+        }
+        token
     });
 
-    let qkv_graph = build_qkv_graph(lib, device, n_state, n_ctx, &prefix, weights,
-        cache_dir, qkv_token.as_ref())?;
+    let qkv_token = cache_token.map(|mut t| { t[31] ^= 0xAA; t });
 
-    let ffn_graph = build_ffn_graph(lib, device, n_state, n_ctx, &prefix, is_last, weights,
-        cache_dir, cache_token)?;
+    let qkv_graph = build_qkv_graph(
+        lib, device, n_state, n_ctx, &prefix, weights,
+        cache_dir, qkv_token.as_ref(),
+    )?;
+
+    let ffn_graph = build_ffn_graph(
+        lib, device, n_state, n_ctx, &prefix, is_last, weights,
+        cache_dir, cache_token.as_ref(),
+    )?;
 
     Ok(EncoderLayer { qkv_graph, ffn_graph })
 }
 
 /// Graph A: input [n_ctx, n_state] → LayerNorm → Q, K, V via FC
-/// Model inputs: [input]
-/// Model outputs: [Q, K, V]
-fn build_qkv_graph<F>(
+fn build_qkv_graph(
     lib: &NnapiLib,
     device: *const ANeuralNetworksDevice,
     n_state: u32,
     n_ctx: u32,
     prefix: &str,
-    weights: &mut F,
+    weights: &mut dyn FnMut(&str) -> Result<Vec<f32>, String>,
     cache_dir: Option<&str>,
     cache_token: Option<&[u8; 32]>,
 ) -> Result<NnapiCompiled, String>
-where
-    F: FnMut(&str) -> Result<Vec<f32>, String>,
 {
     let mut b = NnapiModelBuilder::new(lib)?;
 
-    // Input: [n_ctx, n_state] (flattened from [1, n_ctx, n_state])
     let input = b.add_tensor_f32(&[n_ctx, n_state])?;
 
-    // LayerNorm (operates on 2D: [n_ctx, n_state])
     let ln_out = add_layer_norm_2d(
         &mut b, input,
         &weights(&format!("{prefix}.attn_ln.weight"))?,
@@ -320,7 +393,6 @@ where
         n_ctx, n_state,
     )?;
 
-    // Q projection: FC [n_ctx, n_state] → [n_ctx, n_state]
     let q_out = add_fc(
         &mut b, ln_out,
         &weights(&format!("{prefix}.attn.query.weight"))?,
@@ -328,14 +400,12 @@ where
         n_ctx, n_state, n_state,
     )?;
 
-    // K projection (no bias)
     let k_out = add_fc_no_bias(
         &mut b, ln_out,
         &weights(&format!("{prefix}.attn.key.weight"))?,
         n_ctx, n_state, n_state,
     )?;
 
-    // V projection
     let v_out = add_fc(
         &mut b, ln_out,
         &weights(&format!("{prefix}.attn.value.weight"))?,
@@ -346,31 +416,25 @@ where
     b.finish_and_compile(device, &[input], &[q_out, k_out, v_out], cache_dir, cache_token)
 }
 
-/// Graph B: attn_out + residual → out_proj → add residual → LN → FFN → add residual
-/// Model inputs: [attn_out, residual]
-/// Model outputs: [output]
-fn build_ffn_graph<F>(
+/// Graph B: attn_out + residual → out_proj → add → LN → FFN → add
+fn build_ffn_graph(
     lib: &NnapiLib,
     device: *const ANeuralNetworksDevice,
     n_state: u32,
     n_ctx: u32,
     prefix: &str,
     is_last: bool,
-    weights: &mut F,
+    weights: &mut dyn FnMut(&str) -> Result<Vec<f32>, String>,
     cache_dir: Option<&str>,
     cache_token: Option<&[u8; 32]>,
 ) -> Result<NnapiCompiled, String>
-where
-    F: FnMut(&str) -> Result<Vec<f32>, String>,
 {
     let mut b = NnapiModelBuilder::new(lib)?;
     let n_ff = 4 * n_state;
 
-    // Inputs
     let attn_out = b.add_tensor_f32(&[n_ctx, n_state])?;
     let residual = b.add_tensor_f32(&[n_ctx, n_state])?;
 
-    // Output projection
     let proj_out = add_fc(
         &mut b, attn_out,
         &weights(&format!("{prefix}.attn.out.weight"))?,
@@ -378,10 +442,8 @@ where
         n_ctx, n_state, n_state,
     )?;
 
-    // Residual 1: residual + proj_out
     let res1 = add_add_2d(&mut b, residual, proj_out, n_ctx, n_state)?;
 
-    // LayerNorm 2
     let ln2_out = add_layer_norm_2d(
         &mut b, res1,
         &weights(&format!("{prefix}.mlp_ln.weight"))?,
@@ -389,7 +451,6 @@ where
         n_ctx, n_state,
     )?;
 
-    // FC1: [n_ctx, n_state] → [n_ctx, 4*n_state]
     let fc1_out = add_fc(
         &mut b, ln2_out,
         &weights(&format!("{prefix}.mlp.0.weight"))?,
@@ -397,10 +458,8 @@ where
         n_ctx, n_state, n_ff,
     )?;
 
-    // GELU ≈ x * sigmoid(1.702 * x)
     let gelu_out = add_gelu_approx(&mut b, fc1_out, n_ctx, n_ff)?;
 
-    // FC2: [n_ctx, 4*n_state] → [n_ctx, n_state]
     let fc2_out = add_fc(
         &mut b, gelu_out,
         &weights(&format!("{prefix}.mlp.2.weight"))?,
@@ -408,10 +467,8 @@ where
         n_ctx, n_ff, n_state,
     )?;
 
-    // Residual 2
     let mut output = add_add_2d(&mut b, res1, fc2_out, n_ctx, n_state)?;
 
-    // Post-LayerNorm (last layer only)
     if is_last {
         output = add_layer_norm_2d(
             &mut b, output,
@@ -434,7 +491,6 @@ fn add_weight(b: &mut NnapiModelBuilder, data: &[f32], dims: &[u32]) -> Result<u
     Ok(idx)
 }
 
-/// FULLY_CONNECTED: input [batch, in_size] @ weights [out_size, in_size]^T + bias → [batch, out_size]
 fn add_fc(
     b: &mut NnapiModelBuilder,
     input: u32,
@@ -452,7 +508,6 @@ fn add_fc(
     Ok(output)
 }
 
-/// FULLY_CONNECTED without bias (use zero bias).
 fn add_fc_no_bias(
     b: &mut NnapiModelBuilder,
     input: u32,
@@ -465,7 +520,6 @@ fn add_fc_no_bias(
     add_fc(b, input, w_data, &zeros, batch, in_size, out_size)
 }
 
-/// ADD: a + b (2D, fuse=NONE)
 fn add_add_2d(b: &mut NnapiModelBuilder, a: u32, b_t: u32, m: u32, n: u32) -> Result<u32, String> {
     let fuse = b.const_i32(ANEURALNETWORKS_FUSED_NONE)?;
     let output = b.add_tensor_f32(&[m, n])?;
@@ -473,7 +527,6 @@ fn add_add_2d(b: &mut NnapiModelBuilder, a: u32, b_t: u32, m: u32, n: u32) -> Re
     Ok(output)
 }
 
-/// MUL: a * b (2D, fuse=NONE)
 fn add_mul_2d(b: &mut NnapiModelBuilder, a: u32, b_t: u32, m: u32, n: u32) -> Result<u32, String> {
     let fuse = b.const_i32(ANEURALNETWORKS_FUSED_NONE)?;
     let output = b.add_tensor_f32(&[m, n])?;
@@ -481,7 +534,6 @@ fn add_mul_2d(b: &mut NnapiModelBuilder, a: u32, b_t: u32, m: u32, n: u32) -> Re
     Ok(output)
 }
 
-/// SUB: a - b (2D, fuse=NONE)
 fn add_sub_2d(b: &mut NnapiModelBuilder, a: u32, b_t: u32, m: u32, n: u32) -> Result<u32, String> {
     let fuse = b.const_i32(ANEURALNETWORKS_FUSED_NONE)?;
     let output = b.add_tensor_f32(&[m, n])?;
@@ -489,24 +541,18 @@ fn add_sub_2d(b: &mut NnapiModelBuilder, a: u32, b_t: u32, m: u32, n: u32) -> Re
     Ok(output)
 }
 
-/// MUL by scalar broadcast: input [m, n] * scalar [1] → [m, n]
 fn add_mul_scalar(b: &mut NnapiModelBuilder, input: u32, scalar: f32, m: u32, n: u32) -> Result<u32, String> {
     let s = add_weight(b, &[scalar], &[1])?;
     add_mul_2d(b, input, s, m, n)
 }
 
-/// GELU ≈ x * sigmoid(1.702 * x)
 fn add_gelu_approx(b: &mut NnapiModelBuilder, input: u32, m: u32, n: u32) -> Result<u32, String> {
-    // temp = 1.702 * x
     let temp = add_mul_scalar(b, input, 1.702, m, n)?;
-    // sig = sigmoid(temp)
     let sig = b.add_tensor_f32(&[m, n])?;
     b.add_op(ANEURALNETWORKS_LOGISTIC, &[temp], &[sig])?;
-    // gelu = x * sig
     add_mul_2d(b, input, sig, m, n)
 }
 
-/// SOFTMAX (2D)
 #[allow(dead_code)]
 fn add_softmax_2d(b: &mut NnapiModelBuilder, input: u32, m: u32, n: u32) -> Result<u32, String> {
     let beta = b.const_f32(1.0)?;
@@ -515,8 +561,6 @@ fn add_softmax_2d(b: &mut NnapiModelBuilder, input: u32, m: u32, n: u32) -> Resu
     Ok(output)
 }
 
-/// LayerNorm on 2D tensor [m, n]:
-/// (x - mean) / sqrt(var + eps) * gamma + beta
 fn add_layer_norm_2d(
     b: &mut NnapiModelBuilder,
     input: u32,
@@ -528,48 +572,36 @@ fn add_layer_norm_2d(
     let full = [m, n];
     let reduced = [m, 1u32];
 
-    // axis = [1] (last dim of 2D)
     let axis = b.add_tensor_i32(&[1])?;
     b.set_tensor_i32(axis, &[1])?;
     let keepdims = b.const_i32(1)?;
 
-    // mu = mean(x, axis=1, keepdims)
     let mu = b.add_tensor_f32(&reduced)?;
     b.add_op(ANEURALNETWORKS_MEAN, &[input, axis, keepdims], &[mu])?;
 
-    // diff = x - mu (broadcast [m, n] - [m, 1])
     let diff = add_sub_2d(b, input, mu, m, n)?;
-
-    // diff_sq = diff * diff
     let diff_sq = add_mul_2d(b, diff, diff, m, n)?;
 
-    // axis2 for second mean
     let axis2 = b.add_tensor_i32(&[1])?;
     b.set_tensor_i32(axis2, &[1])?;
     let keepdims2 = b.const_i32(1)?;
 
-    // var = mean(diff_sq, axis=1, keepdims)
     let var = b.add_tensor_f32(&reduced)?;
     b.add_op(ANEURALNETWORKS_MEAN, &[diff_sq, axis2, keepdims2], &[var])?;
 
-    // var_eps = var + epsilon
     let eps = add_weight(b, &[1e-5], &[1])?;
     let fuse_none = b.const_i32(ANEURALNETWORKS_FUSED_NONE)?;
     let var_eps = b.add_tensor_f32(&reduced)?;
     b.add_op(ANEURALNETWORKS_ADD, &[var, eps, fuse_none], &[var_eps])?;
 
-    // inv_std = rsqrt(var_eps)
     let inv_std = b.add_tensor_f32(&reduced)?;
     b.add_op(ANEURALNETWORKS_RSQRT, &[var_eps], &[inv_std])?;
 
-    // normalized = diff * inv_std (broadcast)
     let normalized = add_mul_2d(b, diff, inv_std, m, n)?;
 
-    // scaled = normalized * gamma (broadcast [m, n] * [n])
     let gamma_t = add_weight(b, gamma, &[n])?;
     let scaled = add_mul_2d(b, normalized, gamma_t, m, n)?;
 
-    // output = scaled + beta (broadcast)
     let beta_t = add_weight(b, beta, &[n])?;
     let fuse_none2 = b.const_i32(ANEURALNETWORKS_FUSED_NONE)?;
     let output = b.add_tensor_f32(&full)?;

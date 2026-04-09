@@ -447,7 +447,7 @@ fn bench_nnapi_encoder(
     // Build encoder with dummy weights (measures NPU compilation + execution overhead)
     eprintln!("  (using dummy weights for encoder — measures NPU throughput)");
 
-    let weights_fn = |name: &str| -> Result<Vec<f32>, String> {
+    let weights_fn = move |name: &str| -> Result<Vec<f32>, String> {
         let size = guess_weight_size(name, ns, nl);
         Ok(vec![0.01f32; size])
     };
@@ -462,7 +462,7 @@ fn bench_nnapi_encoder(
         match lib.find_device_by_name(pref) {
             Ok(dev) => {
                 eprintln!("  trying device '{pref}'...");
-                let wf = |name: &str| -> Result<Vec<f32>, String> {
+                let wf = move |name: &str| -> Result<Vec<f32>, String> {
                     let size = guess_weight_size(name, ns, nl);
                     Ok(vec![0.01f32; size])
                 };
@@ -492,7 +492,7 @@ fn bench_nnapi_encoder(
     // Real weights (quantized) use ~10x less memory
     let max_layers = if ns > 768 { 4.min(nl) } else { nl };
     eprintln!("  building encoder ({max_layers}/{nl} layers) on '{selected_name}'...");
-    let encoder = nnapi_backend::WhisperEncoderNnapi::build(
+    let mut encoder = nnapi_backend::WhisperEncoderNnapi::build(
         &lib, selected_device, config.n_state, nh, max_layers, config.n_ctx, weights_fn,
     )?;
 
@@ -506,7 +506,7 @@ fn bench_nnapi_encoder(
     let mut timings = Vec::with_capacity(runs);
     for i in 0..runs {
         let start = Instant::now();
-        encoder.execute(&input).map_err(|e| format!("run {}: {e}", i + 1))?;
+        encoder.execute(&input).map_err(|e: String| format!("run {}: {e}", i + 1))?;
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         timings.push(ms);
         eprintln!("  run {}: {:.1}ms", i + 1, ms);
@@ -556,8 +556,8 @@ fn bench_e2e_npu(
         .or_else(|_| nnapi_lib.find_cpu_device())
         .map_err(|e| format!("NNAPI device: {e}"))?;
 
-    // Weight extraction closure
-    let weights_fn = |name: &str| -> Result<Vec<f32>, String> {
+    // Weight extraction closure (must be 'static for on-demand compilation)
+    let weights_fn = move |name: &str| -> Result<Vec<f32>, String> {
         let name_c = CString::new(name).map_err(|e| format!("{e}"))?;
         let n_elements = unsafe {
             whisper_get_model_tensor_f32(ctx, name_c.as_ptr(), std::ptr::null_mut(), 0)
@@ -578,13 +578,10 @@ fn bench_e2e_npu(
     // Limit layers to avoid OOM (compiled NNAPI models consume ~30MB each)
     // 32 layers × 2 graphs × 30MB = ~1.9GB + model (537MB) = OOM on 3GB device
     // 12 layers × 2 × 30MB = ~720MB + 537MB = ~1.3GB — fits with margin
-    // Limit NNAPI layers to prevent OOM (compiled models ~30MB each + whisper.cpp ~800MB)
-    // 4 layers × 2 graphs × ~30MB = ~240MB — leaves room for whisper.cpp
-    let n_layer = n_layer.min(4);
-    eprintln!("  building NNAPI encoder ({n_layer}/{} layers, real weights)...",
-        unsafe { whisper_model_n_audio_layer(ctx) });
+    // On-demand compilation: first 8 layers precompiled, rest compiled per-chunk during execute
+    eprintln!("  building NNAPI encoder ({n_layer} layers, chunk=8)...");
 
-    let nnapi_encoder = nnapi_backend::WhisperEncoderNnapi::build(
+    let mut nnapi_encoder = nnapi_backend::WhisperEncoderNnapi::build(
         &nnapi_lib, device, n_state, n_head, n_layer, n_ctx, weights_fn,
     ).map_err(|e| format!("NNAPI build: {e}"))?;
 
@@ -683,7 +680,7 @@ fn bench_e2e_npu(
     timings.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     Ok(BenchResult {
-        label: format!("E2E NPU ({n_layer}L)"),
+        label: format!("E2E NPU ({}L)", unsafe { whisper_model_n_audio_layer(ctx) }),
         median_ms: timings[timings.len() / 2],
         min_ms: timings[0],
         max_ms: *timings.last().unwrap(),
