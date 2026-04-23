@@ -1,5 +1,6 @@
-use crate::config::{Backend, Model, Quantization, SttConfig};
+use crate::config::{Backend, Quantization, SttConfig};
 use crate::hardware::{GpuVendor, HardwareInfo, NpuType, Platform};
+use crate::model::Model;
 
 /// Result of backend selection: which backend and quantization to use.
 #[derive(Debug, Clone)]
@@ -78,7 +79,8 @@ fn select_quantization(model: &Model, hw: &HardwareInfo, backend: Backend) -> Qu
         _ => hw.available_ram_mb,
     };
 
-    let model_base_mb = model_size_estimate_f16_mb(model);
+    // Size estimate is owned by each Model family in `crate::model`.
+    let model_base_mb = model.size_estimate_f16_mb();
 
     // Pick the best quantization that fits in available memory.
     // Walk from highest quality to lowest, return first that fits.
@@ -104,27 +106,13 @@ const QUANTIZATION_RATIOS: &[(Quantization, f64)] = &[
     (Quantization::Q4_0, 0.25),
 ];
 
-/// Rough f16 model size estimate in MB.
-fn model_size_estimate_f16_mb(model: &Model) -> u64 {
-    match model {
-        Model::Tiny | Model::TinyEn => 75,
-        Model::Base | Model::BaseEn => 150,
-        Model::Small | Model::SmallEn => 500,
-        Model::DistilSmallEn => 400,
-        Model::Medium | Model::MediumEn => 1500,
-        Model::DistilMediumEn => 1200,
-        Model::LargeV1 | Model::LargeV2 | Model::LargeV3 => 3100,
-        Model::LargeV3Turbo => 1600,
-        Model::DistilLargeV2 | Model::DistilLargeV3 => 1600,
-        Model::KotobaV1 | Model::KotobaV2 => 1600,
-        Model::Custom(_) => 1500, // Conservative default for unknown models.
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hardware::*;
+    use crate::model::{
+        ParakeetVariant, QwenAsrVariant, ReazonSpeechVariant, WhisperVariant,
+    };
 
     fn make_hw(
         platform: Platform,
@@ -292,7 +280,7 @@ mod tests {
             64000,
         );
         let config = SttConfig {
-            model: Model::LargeV3,
+            model: Model::Whisper(WhisperVariant::LargeV3),
             ..Default::default()
         };
         let sel = select(&config, &hw);
@@ -304,7 +292,7 @@ mod tests {
     fn limited_ram_selects_smaller_quant() {
         let hw = make_hw(Platform::Linux, None, None, 600);
         let config = SttConfig {
-            model: Model::LargeV3,
+            model: Model::Whisper(WhisperVariant::LargeV3),
             ..Default::default()
         };
         let sel = select(&config, &hw);
@@ -317,7 +305,7 @@ mod tests {
     fn tiny_model_fits_f16_even_low_ram() {
         let hw = make_hw(Platform::Linux, None, None, 200);
         let config = SttConfig {
-            model: Model::Tiny,
+            model: Model::Whisper(WhisperVariant::Tiny),
             ..Default::default()
         };
         let sel = select(&config, &hw);
@@ -464,5 +452,57 @@ mod tests {
         );
         let sel = select(&SttConfig::default(), &hw);
         assert_eq!(sel.backend, Backend::CoreMl);
+    }
+
+    // --- Multi-family quantization selection ---
+
+    #[test]
+    fn reazonspeech_nemo_v2_fits_f16_in_4gb() {
+        // NemoV2 ≈ 1250 MB at f16, 4 GB available → F16 fits.
+        let hw = make_hw(Platform::Linux, None, None, 4000);
+        let config = SttConfig {
+            model: Model::ReazonSpeech(ReazonSpeechVariant::NemoV2),
+            ..Default::default()
+        };
+        let sel = select(&config, &hw);
+        assert_eq!(sel.quantization, Quantization::F16);
+    }
+
+    #[test]
+    fn reazonspeech_nemo_v2_needs_q8_on_android_1gb() {
+        // 1250 MB f16 does not fit in 1 GB, but Q8_0 (~625 MB) does.
+        let hw = make_hw(Platform::Android, None, None, 1000);
+        let config = SttConfig {
+            model: Model::ReazonSpeech(ReazonSpeechVariant::NemoV2),
+            ..Default::default()
+        };
+        let sel = select(&config, &hw);
+        assert_eq!(sel.quantization, Quantization::Q8_0);
+    }
+
+    #[test]
+    fn parakeet_tdt_fits_q8_in_1gb() {
+        let hw = make_hw(Platform::Linux, None, None, 1000);
+        let config = SttConfig {
+            model: Model::Parakeet(ParakeetVariant::Tdt0_6bV3),
+            ..Default::default()
+        };
+        let sel = select(&config, &hw);
+        // 1200 MB f16 * 0.5 (Q8_0) = 600 MB, fits in 1000 MB.
+        assert_eq!(sel.quantization, Quantization::Q8_0);
+    }
+
+    #[test]
+    fn qwen_asr_1_7b_needs_q4_on_low_ram() {
+        // 3400 MB f16 in 1 GB RAM:
+        //   F16 3400, Q8_0 1700, Q5_1 1190, Q5_0 1122 → none fit.
+        //   Q4_1 = 952 MB → first that fits.
+        let hw = make_hw(Platform::Linux, None, None, 1000);
+        let config = SttConfig {
+            model: Model::QwenAsr(QwenAsrVariant::B1_7),
+            ..Default::default()
+        };
+        let sel = select(&config, &hw);
+        assert_eq!(sel.quantization, Quantization::Q4_1);
     }
 }
