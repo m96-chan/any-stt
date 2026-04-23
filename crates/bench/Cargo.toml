@@ -15,9 +15,21 @@ qnn-backend = { path = "../qnn-backend" }
 nnapi-backend = { path = "../nnapi-backend" }
 gguf-loader = { path = "../gguf-loader" }
 hound = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-normalization = "0.1"
+thiserror = "2"
 
 [features]
+# Default: only features that compile cleanly against the public fork APIs.
+default = []
+
+# Acceleration passthrough.
 vulkan = ["whisper-backend/vulkan"]
 metal = ["whisper-backend/metal"]
 coreml = ["whisper-backend/coreml"]
 cuda = ["whisper-backend/cuda"]
+
+# Gate legacy Whisper-internals bench paths that rely on fork-only C APIs
+# not yet merged upstream (whisper_get_model_tensor_f32, ...).
+fork-ext = []

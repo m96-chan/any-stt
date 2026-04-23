@@ -1,14 +1,27 @@
-//! Whisper benchmark: CPU vs GPU (Vulkan) vs NPU (QNN HTP) encoder.
+//! any-stt benchmark tool.
 //!
-//! Usage:
-//!   bench-whisper --model <path> --audio <path> [--runs N] [--backend cpu|gpu|npu|preprocess|all]
+//! Two modes:
 //!
-//! Backends:
-//!   cpu        — Full whisper.cpp transcription on CPU
-//!   gpu        — Full whisper.cpp transcription on GPU (Vulkan)
-//!   npu        — QNN HTP encoder only (standalone)
-//!   preprocess — CPU preprocessor only (Conv1d + GELU + pos_embed)
-//!   all        — Run all of the above
+//! ## accuracy (family-agnostic)
+//! Runs a manifest of (audio, reference) pairs through any backend that
+//! implements `any_stt::SttEngine`. Reports CER / WER / RTF.
+//!
+//!   bench-whisper --mode accuracy --manifest <path> --model <path> [--runs N]
+//!                 [--backend cpu|cuda|vulkan|metal|coreml]
+//!                 [--output-md <path>] [--output-json <path>]
+//!
+//! ## whisper-internals (default, legacy)
+//! Whisper-specific micro-benchmarks (preprocessor / encoder-only / inject
+//! round-trip / hybrid / E2E NPU). Requires a whisper.cpp ggml model.
+//!
+//!   bench-whisper --model <path> --audio <path> [--runs N]
+//!                 [--backend cpu|gpu|npu|nnapi|preprocess|inject|hybrid|e2e|all]
+
+mod accuracy;
+mod driver;
+mod manifest;
+mod report;
+mod shared;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -18,8 +31,17 @@ use any_stt::{SttEngine, SttResult};
 use qnn_backend::EncoderConfig;
 use whisper_backend::WhisperEngine;
 
+use report::BenchResult;
+use shared::load_audio;
+
 fn main() {
     let args = parse_args();
+
+    // --- Accuracy mode (family-agnostic CER/WER/RTF) ---
+    if let Mode::Accuracy(ref acc) = args.mode {
+        run_accuracy_mode(acc);
+        return;
+    }
 
     // Sub-process mode: run a single backend benchmark and exit.
     // This prevents segfaults (e.g., Vulkan) from killing the whole process.
@@ -96,11 +118,17 @@ fn main() {
                     Err(e) => eprintln!("  SKIP: {e}"),
                 }
             }
+            #[cfg(feature = "fork-ext")]
             BenchBackend::E2e => {
                 match bench_e2e_npu(&args.model, &audio, args.runs, &args.language) {
                     Ok(r) => { print_result(&r); results.push(r); }
                     Err(e) => eprintln!("  SKIP: {e}"),
                 }
+            }
+            #[cfg(not(feature = "fork-ext"))]
+            BenchBackend::E2e => {
+                eprintln!("  SKIP: e2e requires --features fork-ext \
+                    (whisper_get_model_tensor_f32 not in upstream whisper.cpp)");
             }
             BenchBackend::Hybrid => {
                 match bench_hybrid(&args.model, &audio, args.runs, &args.language) {
@@ -523,7 +551,10 @@ fn bench_nnapi_encoder(
     })
 }
 
-/// Full E2E: whisper weights → NNAPI NPU encoder → inject → decode
+/// Full E2E: whisper weights → NNAPI NPU encoder → inject → decode.
+/// Requires `whisper_get_model_tensor_f32` which lives only on the m96-chan
+/// fork branch, not in upstream. Gated behind `--features fork-ext`.
+#[cfg(feature = "fork-ext")]
 fn bench_e2e_npu(
     model_path: &Path,
     audio: &[f32],
@@ -1215,35 +1246,38 @@ fn detect_encoder_config(model_path: &Path) -> Result<EncoderConfig, String> {
     }
 }
 
-// --- Audio loading ---
-
-fn load_audio(path: &Path) -> Vec<f32> {
-    let reader = hound::WavReader::open(path)
-        .unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
-    let spec = reader.spec();
-    assert_eq!(spec.channels, 1, "expected mono audio");
-    assert_eq!(spec.sample_rate, 16000, "expected 16kHz sample rate");
-    match spec.sample_format {
-        hound::SampleFormat::Int => {
-            let max_val = (1u32 << (spec.bits_per_sample - 1)) as f32;
-            reader.into_samples::<i32>().map(|s| s.unwrap() as f32 / max_val).collect()
-        }
-        hound::SampleFormat::Float => {
-            reader.into_samples::<f32>().map(|s| s.unwrap()).collect()
-        }
-    }
-}
-
 // --- Types ---
 
 #[derive(Debug)]
 struct Args {
+    /// Selected mode. Accuracy is family-agnostic; Internals is Whisper-only.
+    mode: Mode,
+    /// Defaults used by whisper-internals mode. Ignored in accuracy mode.
     model: PathBuf,
     audio: PathBuf,
     runs: usize,
     backend: BackendArg,
     subprocess: Option<String>,
     language: String,
+}
+
+#[derive(Debug, Clone)]
+enum Mode {
+    /// Legacy Whisper-specific benchmarks (encoder-only, preprocess, inject, ...).
+    WhisperInternals,
+    /// Manifest-driven CER / WER / RTF run via `SttEngine`.
+    Accuracy(AccuracyArgs),
+}
+
+#[derive(Debug, Clone)]
+struct AccuracyArgs {
+    manifest: PathBuf,
+    model: PathBuf,
+    runs: usize,
+    language_override: Option<String>,
+    backend: Backend,
+    output_md: Option<PathBuf>,
+    output_json: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1285,40 +1319,42 @@ impl BenchBackend {
     }
 }
 
-struct BenchResult {
-    label: String,
-    median_ms: f64,
-    min_ms: f64,
-    max_ms: f64,
-    text: String,
-}
-
 fn print_result(r: &BenchResult) {
-    eprintln!("  → median: {:.1}ms, min: {:.1}ms, max: {:.1}ms",
-        r.median_ms, r.min_ms, r.max_ms);
-    if !r.text.is_empty() && !r.text.starts_with('(') {
-        eprintln!("  → text: \"{}\"", r.text.trim());
-    }
+    r.print();
 }
 
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
+    let mut mode_str: Option<String> = None;
+    let mut manifest: Option<PathBuf> = None;
+    let mut output_md: Option<PathBuf> = None;
+    let mut output_json: Option<PathBuf> = None;
+    let mut accuracy_backend_str: Option<String> = None;
     let mut model: Option<PathBuf> = None;
     let mut audio: Option<PathBuf> = None;
     let mut runs = 3usize;
     let mut backend = BackendArg::Cpu;
     let mut subprocess: Option<String> = None;
     let mut language = "en".to_string();
+    let mut language_set = false;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--mode" => { i += 1; mode_str = Some(args[i].clone()); }
+            "--manifest" => { i += 1; manifest = Some(PathBuf::from(&args[i])); }
+            "--output-md" => { i += 1; output_md = Some(PathBuf::from(&args[i])); }
+            "--output-json" => { i += 1; output_json = Some(PathBuf::from(&args[i])); }
             "--model" | "-m" => { i += 1; model = Some(PathBuf::from(&args[i])); }
             "--audio" | "-a" => { i += 1; audio = Some(PathBuf::from(&args[i])); }
             "--runs" | "-r" => { i += 1; runs = args[i].parse().expect("--runs must be a number"); }
-            "--lang" | "-l" => { i += 1; language = args[i].clone(); }
+            "--lang" | "-l" => { i += 1; language = args[i].clone(); language_set = true; }
             "--backend" | "-b" => {
                 i += 1;
+                // Keep the raw string so accuracy mode can map to Backend
+                // (cpu|cuda|vulkan|metal|coreml) and whisper-internals mode
+                // can map to BackendArg (cpu|gpu|npu|nnapi|...).
+                accuracy_backend_str = Some(args[i].clone());
                 backend = match args[i].as_str() {
                     "cpu" => BackendArg::Cpu,
                     "gpu" => BackendArg::Gpu,
@@ -1329,18 +1365,45 @@ fn parse_args() -> Args {
                     "preprocess" => BackendArg::Preprocess,
                     "hybrid" => BackendArg::Hybrid,
                     "all" => BackendArg::All,
+                    // Accuracy-mode backends: swallow here, will be parsed
+                    // later against `accuracy_backend_str`.
+                    "cuda" | "vulkan" | "metal" | "coreml" => BackendArg::Cpu,
                     other => panic!("unknown backend: {other}"),
                 };
             }
             "--subprocess" => { i += 1; subprocess = Some(args[i].clone()); }
             "--help" | "-h" => {
-                eprintln!("Usage: bench-whisper --model <path> --audio <path> [--runs N] [--backend cpu|gpu|npu|preprocess|all]");
+                print_help();
                 std::process::exit(0);
             }
             _ => { eprintln!("unknown argument: {}", args[i]); std::process::exit(1); }
         }
         i += 1;
     }
+
+    // Dispatch on --mode.
+    let mode = match mode_str.as_deref() {
+        Some("accuracy") => {
+            let manifest = manifest.unwrap_or_else(|| {
+                panic!("--mode accuracy requires --manifest <path>")
+            });
+            let model = model.clone().unwrap_or_else(|| {
+                panic!("--mode accuracy requires --model <path>")
+            });
+            let backend = parse_accuracy_backend(accuracy_backend_str.as_deref());
+            Mode::Accuracy(AccuracyArgs {
+                manifest,
+                model,
+                runs,
+                language_override: if language_set { Some(language.clone()) } else { None },
+                backend,
+                output_md,
+                output_json,
+            })
+        }
+        Some("whisper-internals") | None => Mode::WhisperInternals,
+        Some(other) => panic!("unknown --mode '{other}' (expected 'accuracy' | 'whisper-internals')"),
+    };
 
     let model = model.unwrap_or_else(|| {
         for p in &["third-party/whisper.cpp/models/ggml-tiny.en.bin", "/data/local/tmp/any-stt/ggml-tiny.en.bin"] {
@@ -1355,8 +1418,86 @@ fn parse_args() -> Args {
             let pb = PathBuf::from(p);
             if pb.exists() { return pb; }
         }
-        panic!("--audio not specified and no default found");
+        // In accuracy mode, `audio` is unused; provide a dummy to satisfy the struct.
+        PathBuf::new()
     });
 
-    Args { model, audio, runs, backend, subprocess, language }
+    Args { mode, model, audio, runs, backend, subprocess, language }
+}
+
+fn parse_accuracy_backend(s: Option<&str>) -> Backend {
+    match s {
+        Some("cpu") | None => Backend::Cpu,
+        Some("cuda") => Backend::Cuda,
+        Some("vulkan") => Backend::Vulkan,
+        Some("metal") => Backend::Metal,
+        Some("coreml") => Backend::CoreMl,
+        Some(other) => panic!(
+            "--mode accuracy: unknown --backend '{other}' \
+             (expected cpu|cuda|vulkan|metal|coreml)"
+        ),
+    }
+}
+
+fn print_help() {
+    eprintln!("Usage:");
+    eprintln!();
+    eprintln!("  bench-whisper --mode accuracy --manifest <path> --model <path> \\");
+    eprintln!("                [--runs N] [--backend cpu|cuda|vulkan|metal|coreml] \\");
+    eprintln!("                [--output-md <path>] [--output-json <path>]");
+    eprintln!();
+    eprintln!("  bench-whisper --model <path> --audio <path> [--runs N] \\");
+    eprintln!("                [--backend cpu|gpu|npu|nnapi|preprocess|inject|hybrid|e2e|all] \\");
+    eprintln!("                [--lang en|ja|...]");
+}
+
+// --- Accuracy mode driver ---
+
+fn run_accuracy_mode(args: &AccuracyArgs) {
+    eprintln!("=== Accuracy benchmark ===");
+    eprintln!("Manifest: {}", args.manifest.display());
+    eprintln!("Model:    {}", args.model.display());
+    eprintln!("Backend:  {:?}", args.backend);
+    eprintln!("Runs:     {}", args.runs);
+
+    let manifest = manifest::Manifest::load(&args.manifest)
+        .unwrap_or_else(|e| panic!("manifest load failed: {e}"));
+
+    eprintln!("Items:    {}", manifest.items.len());
+    eprintln!();
+
+    let hw = any_stt::detect_hardware();
+    // For Whisper family the language is set per-item by the engine itself
+    // using `language` from the manifest. We seed with the first item's
+    // language for WhisperEngine (which is constructed once).
+    let seed_lang = args
+        .language_override
+        .clone()
+        .or_else(|| manifest.items.first().map(|i| i.language.clone()))
+        .unwrap_or_else(|| "en".to_string());
+
+    let engine = WhisperEngine::new(&args.model, &seed_lang, args.backend, hw)
+        .unwrap_or_else(|e| panic!("engine init failed: {e}"));
+
+    let normalize_opts = accuracy::NormalizeOpts::default();
+    let report = driver::run_manifest(&manifest, &engine, args.runs, true, &normalize_opts)
+        .unwrap_or_else(|e| panic!("bench run failed: {e}"));
+
+    let md = report::markdown(&report);
+    println!("{md}");
+
+    if let Some(ref path) = args.output_md {
+        std::fs::write(path, &md).unwrap_or_else(|e| {
+            panic!("failed to write {}: {e}", path.display())
+        });
+        eprintln!("wrote markdown → {}", path.display());
+    }
+
+    if let Some(ref path) = args.output_json {
+        let json = report::json(&report).expect("json serialize");
+        std::fs::write(path, &json).unwrap_or_else(|e| {
+            panic!("failed to write {}: {e}", path.display())
+        });
+        eprintln!("wrote json → {}", path.display());
+    }
 }
