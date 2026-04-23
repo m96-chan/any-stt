@@ -1,0 +1,23 @@
+[package]
+name = "reazonspeech-backend"
+description = "ReazonSpeech (Japanese ASR) backend for any-stt — FastConformer + RNN-T"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+any-stt = { path = "../any-stt" }
+gguf-loader = { path = "../gguf-loader" }
+thiserror = "2"
+
+[features]
+# NPU-first path (Snapdragon QNN / generic NNAPI).
+# Off by default so the skeleton compiles in any environment;
+# production builds enable these on the relevant targets.
+qnn = []
+nnapi = []
+vulkan = []
+cuda = []
+metal = []

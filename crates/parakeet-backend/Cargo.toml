@@ -1,0 +1,20 @@
+[package]
+name = "parakeet-backend"
+description = "NVIDIA Parakeet TDT backend for any-stt — FastConformer + TDT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+any-stt = { path = "../any-stt" }
+gguf-loader = { path = "../gguf-loader" }
+thiserror = "2"
+
+[features]
+qnn = []
+nnapi = []
+vulkan = []
+cuda = []
+metal = []
