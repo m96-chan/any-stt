@@ -1467,21 +1467,53 @@ fn run_accuracy_mode(args: &AccuracyArgs) {
     eprintln!();
 
     let hw = any_stt::detect_hardware();
-    // For Whisper family the language is set per-item by the engine itself
-    // using `language` from the manifest. We seed with the first item's
-    // language for WhisperEngine (which is constructed once).
-    let seed_lang = args
-        .language_override
-        .clone()
-        .or_else(|| manifest.items.first().map(|i| i.language.clone()))
-        .unwrap_or_else(|| "en".to_string());
-
-    let engine = WhisperEngine::new(&args.model, &seed_lang, args.backend, hw)
-        .unwrap_or_else(|e| panic!("engine init failed: {e}"));
-
     let normalize_opts = accuracy::NormalizeOpts::default();
-    let report = driver::run_manifest(&manifest, &engine, args.runs, true, &normalize_opts)
-        .unwrap_or_else(|e| panic!("bench run failed: {e}"));
+
+    // WhisperEngine has a fixed language baked in at construction. Group
+    // manifest items by language and build one engine per group so each
+    // item is transcribed in its true language, not whatever happened to
+    // be first in the manifest. (`SttEngine::transcribe` does not take a
+    // language argument by design — that's a property of the loaded engine.)
+    let mut by_lang: std::collections::BTreeMap<String, Vec<manifest::Item>> =
+        std::collections::BTreeMap::new();
+    for item in &manifest.items {
+        let key = args
+            .language_override
+            .clone()
+            .unwrap_or_else(|| item.language.clone());
+        by_lang.entry(key).or_default().push(item.clone());
+    }
+
+    let mut all_items: Vec<driver::ItemResult> = Vec::with_capacity(manifest.items.len());
+    for (lang, items) in &by_lang {
+        eprintln!("[lang={lang}] loading model for {} item(s)...", items.len());
+        let engine = WhisperEngine::new(&args.model, lang, args.backend, hw.clone())
+            .unwrap_or_else(|e| panic!("engine init for lang={lang} failed: {e}"));
+
+        let sub_manifest = manifest::Manifest {
+            name: format!("{} [{lang}]", manifest.name),
+            sample_rate: manifest.sample_rate,
+            items: items.clone(),
+        };
+        let sub_report =
+            driver::run_manifest(&sub_manifest, &engine, args.runs, true, &normalize_opts)
+                .unwrap_or_else(|e| panic!("bench run failed for lang={lang}: {e}"));
+        all_items.extend(sub_report.items);
+    }
+
+    // Reorder results to match the original manifest ordering so the
+    // report rows are predictable for the user.
+    all_items.sort_by_key(|r| {
+        manifest
+            .items
+            .iter()
+            .position(|m| m.id == r.id)
+            .unwrap_or(usize::MAX)
+    });
+    let report = driver::ReportRow {
+        manifest_name: manifest.name.clone(),
+        items: all_items,
+    };
 
     let md = report::markdown(&report);
     println!("{md}");
