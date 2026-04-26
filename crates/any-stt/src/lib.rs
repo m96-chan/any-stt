@@ -2,11 +2,15 @@ pub mod config;
 pub mod detect;
 pub mod error;
 pub mod hardware;
+pub mod model;
 pub mod selector;
 
-pub use config::{Backend, Model, Quantization, SttConfig};
+pub use config::{Backend, Quantization, SttConfig};
 pub use error::SttError;
 pub use hardware::HardwareInfo;
+pub use model::{
+    Model, ModelFamily, ParakeetVariant, QwenAsrVariant, ReazonSpeechVariant, WhisperVariant,
+};
 pub use selector::Selection;
 
 /// Result of a transcription.
@@ -19,6 +23,10 @@ pub struct SttResult {
 }
 
 /// Core trait that all backends implement.
+///
+/// Each family's backend crate (`whisper-backend`, `reazonspeech-backend`,
+/// `parakeet-backend`, `qwen-asr-backend`) provides its own engine types that
+/// implement this trait plus a concrete `initialize()` factory.
 pub trait SttEngine: Send + Sync {
     /// Transcribe audio samples (f32 PCM, mono, at the configured sample rate).
     fn transcribe(&self, audio: &[f32]) -> Result<SttResult, SttError>;
@@ -33,41 +41,32 @@ pub trait SttEngine: Send + Sync {
     fn active_backend(&self) -> Backend;
 }
 
-/// Detect hardware, select the best backend and quantization, and load a model.
+/// Detect hardware, select the best backend and quantization, and return a
+/// diagnostic pointing at the family-specific backend crate.
 ///
-/// Returns a boxed [`SttEngine`] ready to transcribe audio.
+/// `any-stt` deliberately does not depend on the backend crates (to keep
+/// the dependency tree one-way: `*-backend` → `any-stt`). Callers should
+/// invoke `initialize()` on the crate that matches `config.model.family()`:
 ///
-/// On Snapdragon devices with QNN HTP, uses WhisperQnnEngine (Hexagon DSP).
-/// On MediaTek Dimensity / other Android, uses WhisperNnapiEngine (NeuroPilot).
-/// Falls back to CPU-only whisper.cpp if no NPU is available.
+/// - [`ModelFamily::Whisper`] → `whisper_backend::initialize`
+/// - [`ModelFamily::ReazonSpeech`] → `reazonspeech_backend::initialize`
+/// - [`ModelFamily::Parakeet`] → `parakeet_backend::initialize`
+/// - [`ModelFamily::QwenAsr`] → `qwen_asr_backend::initialize`
+///
+/// This function returns [`SttError::NotImplemented`] with a message that
+/// names the correct backend crate for programmatic use.
 pub fn initialize(config: SttConfig) -> Result<Box<dyn SttEngine>, SttError> {
     let hw = detect::detect_hardware();
     let selection = selector::select(&config, &hw);
+    let family = config.model.family();
 
-    match selection.backend {
-        Backend::Qnn => {
-            // Snapdragon: QNN HTP (Hexagon DSP) — use WhisperQnnEngine
-            Err(SttError::NotImplemented(
-                "QNN backend selected — use whisper_backend::hybrid::WhisperQnnEngine::new() directly".into(),
-            ))
-        }
-        Backend::Nnapi => {
-            // MediaTek / generic Android: NNAPI (NeuroPilot) — use WhisperNnapiEngine
-            Err(SttError::NotImplemented(
-                "NNAPI backend selected — use whisper_backend::nnapi_hybrid::WhisperNnapiEngine::new() directly".into(),
-            ))
-        }
-        Backend::Cpu => {
-            // CPU fallback — caller must construct WhisperEngine.
-            Err(SttError::NotImplemented(
-                "CPU backend selected — use whisper_backend::WhisperEngine::new() directly".into(),
-            ))
-        }
-        other => Err(SttError::BackendUnavailable {
-            backend: other,
-            reason: "backend not yet implemented".into(),
-        }),
-    }
+    Err(SttError::NotImplemented(format!(
+        "family={} backend={:?} quantization={:?} — call {}::initialize() directly",
+        family.label(),
+        selection.backend,
+        selection.quantization,
+        family.backend_crate(),
+    )))
 }
 
 /// Detect hardware capabilities without loading a model.
@@ -83,7 +82,7 @@ mod tests {
     fn default_config() {
         let config = SttConfig::default();
         assert_eq!(config.language, "en");
-        assert_eq!(config.model, Model::Small);
+        assert_eq!(config.model, Model::Whisper(WhisperVariant::Small));
         assert_eq!(config.sample_rate, 16000);
         assert!(!config.allow_cold_vulkan);
         assert!(config.backend.is_none());
@@ -92,12 +91,64 @@ mod tests {
     }
 
     #[test]
-    fn initialize_returns_error() {
+    fn initialize_returns_error_pointing_at_backend_crate() {
         let result = initialize(SttConfig::default());
-        // initialize() should return an error since no real backend is wired up yet.
-        // The specific error depends on detected hardware (NotImplemented for CPU,
-        // BackendUnavailable for GPU backends).
-        assert!(result.is_err(), "expected error, got Ok");
+        match result {
+            Err(SttError::NotImplemented(msg)) => {
+                assert!(
+                    msg.contains("whisper_backend"),
+                    "default config is Whisper family; message should name \
+                     whisper_backend crate, got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected NotImplemented, got different error: {e}"),
+            Ok(_) => panic!("expected NotImplemented, got Ok"),
+        }
+    }
+
+    #[test]
+    fn initialize_for_reazonspeech_names_its_backend_crate() {
+        let config = SttConfig {
+            model: Model::ReazonSpeech(ReazonSpeechVariant::NemoV2),
+            ..Default::default()
+        };
+        match initialize(config) {
+            Err(SttError::NotImplemented(msg)) => {
+                assert!(msg.contains("reazonspeech_backend"), "got: {msg}");
+            }
+            Err(e) => panic!("expected NotImplemented, got different error: {e}"),
+            Ok(_) => panic!("expected NotImplemented, got Ok"),
+        }
+    }
+
+    #[test]
+    fn initialize_for_parakeet_names_its_backend_crate() {
+        let config = SttConfig {
+            model: Model::Parakeet(ParakeetVariant::Tdt0_6bV3),
+            ..Default::default()
+        };
+        match initialize(config) {
+            Err(SttError::NotImplemented(msg)) => {
+                assert!(msg.contains("parakeet_backend"), "got: {msg}");
+            }
+            Err(e) => panic!("expected NotImplemented, got different error: {e}"),
+            Ok(_) => panic!("expected NotImplemented, got Ok"),
+        }
+    }
+
+    #[test]
+    fn initialize_for_qwen_asr_names_its_backend_crate() {
+        let config = SttConfig {
+            model: Model::QwenAsr(QwenAsrVariant::B1_7),
+            ..Default::default()
+        };
+        match initialize(config) {
+            Err(SttError::NotImplemented(msg)) => {
+                assert!(msg.contains("qwen_asr_backend"), "got: {msg}");
+            }
+            Err(e) => panic!("expected NotImplemented, got different error: {e}"),
+            Ok(_) => panic!("expected NotImplemented, got Ok"),
+        }
     }
 
     #[test]
@@ -114,9 +165,13 @@ mod tests {
     }
 
     #[test]
-    fn model_custom() {
+    fn model_custom_defaults_to_whisper_family() {
         let m = Model::Custom("kotoba-tech/kotoba-whisper-v2.0".into());
-        assert_eq!(m, Model::Custom("kotoba-tech/kotoba-whisper-v2.0".into()));
-        assert_ne!(m, Model::KotobaV2);
+        assert_eq!(m.family(), ModelFamily::Whisper);
+        assert_eq!(
+            m,
+            Model::Custom("kotoba-tech/kotoba-whisper-v2.0".into())
+        );
+        assert_ne!(m, Model::Whisper(WhisperVariant::KotobaV2));
     }
 }

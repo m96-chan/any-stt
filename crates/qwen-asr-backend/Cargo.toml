@@ -1,0 +1,20 @@
+[package]
+name = "qwen-asr-backend"
+description = "Qwen3-ASR backend for any-stt — Qwen3-Omni multimodal LLM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+any-stt = { path = "../any-stt" }
+gguf-loader = { path = "../gguf-loader" }
+thiserror = "2"
+
+[features]
+qnn = []
+nnapi = []
+vulkan = []
+cuda = []
+metal = []
