@@ -62,6 +62,10 @@ jobs:
           # installer is still on NVIDIA's CDN.
           cuda: '12.6.2'
           method: network
+          # Driver/dkms is irrelevant on a headless runner (and crashes
+          # nvidia-dkms-560-open during dpkg --configure). Install only
+          # the build-time pieces ggml-cuda needs.
+          sub-packages: '["nvcc", "cudart", "cudart-dev", "cublas", "cublas-dev", "cuda-driver-dev"]'
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -187,6 +191,10 @@ jobs:
           # installer is still on NVIDIA's CDN.
           cuda: '12.6.2'
           method: network
+          # Driver/dkms is irrelevant on a headless runner (and crashes
+          # nvidia-dkms-560-open during dpkg --configure). Install only
+          # the build-time pieces ggml-cuda needs.
+          sub-packages: '["nvcc", "cudart", "cudart-dev", "cublas", "cublas-dev", "cuda-driver-dev"]'
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

@@ -90,6 +90,14 @@ fn main() {
     } else if is_windows {
         // MSVC OpenMP uses vcomp (incompatible with gomp); disable for simplicity.
         cfg.define("GGML_OPENMP", "OFF");
+
+        // Force release CRT (/MD) regardless of cargo profile. cargo+rustc
+        // always link against `msvcrt` (release CRT), but cmake-rs would
+        // pick `/MDd` for debug builds, producing _calloc_dbg / _free_dbg /
+        // _CrtDbgReport unresolved symbols at the rustc link step.
+        cfg.define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreadedDLL");
+        // Older CMake policy that respected this knob.
+        cfg.define("CMAKE_POLICY_DEFAULT_CMP0091", "NEW");
     } else {
         // Linux: OpenMP enabled
         cfg.define("GGML_OPENMP", "ON");
@@ -205,7 +213,11 @@ fn main() {
             println!("cargo:rustc-link-lib=framework=Accelerate");
             println!("cargo:rustc-link-lib=c++");
         } else if is_windows {
-            // MSVC links C++ runtime automatically.
+            // MSVC links C++ runtime automatically, but ggml-cpu's CPU
+            // capability detection uses RegOpenKeyExA / RegQueryValueExA /
+            // RegCloseKey from advapi32. The rust toolchain does not link
+            // it by default.
+            println!("cargo:rustc-link-lib=advapi32");
         } else {
             // Linux
             println!("cargo:rustc-link-lib=stdc++");
