@@ -31,3 +31,7 @@ cuda = []
 [build-dependencies]
 cmake = "0.1"
 cc = "1"
+# dunce strips the `\\?\` extended-length prefix that std::fs::canonicalize
+# adds on Windows, which otherwise propagates into cmake-rs and eventually
+# into MSVC `/I` flags, breaking compilation. No-op on non-Windows.
+dunce = "1"

@@ -266,7 +266,11 @@ fn resolve_whisper_source(manifest_dir: &PathBuf) -> PathBuf {
     // Check submodule path (works in git checkout)
     let submodule_dir = manifest_dir.join("../../third-party/whisper.cpp");
     if submodule_dir.join("CMakeLists.txt").exists() {
-        return submodule_dir.canonicalize().unwrap();
+        // Use dunce::canonicalize on Windows so the result does not carry
+        // the `\\?\` extended-length prefix. cmake-rs will otherwise pass
+        // that prefix to MSVC, breaking `/I` include lookups inside Ninja
+        // and MSBuild generated commands.
+        return dunce::canonicalize(&submodule_dir).unwrap_or(submodule_dir);
     }
 
     // crates.io: fetch source into OUT_DIR

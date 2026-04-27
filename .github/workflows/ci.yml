@@ -57,8 +57,10 @@ jobs:
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
-          # 12.6.3 was de-listed by NVIDIA; 12.8.0 is current and stable.
-          cuda: '12.8.0'
+          # v0.2.19's hardcoded version list tops out at 12.6.2; later
+          # versions (12.6.3, 12.8.x) are not wired in even when their
+          # installer is still on NVIDIA's CDN.
+          cuda: '12.6.2'
           method: network
 
       - name: Setup Rust
@@ -180,8 +182,10 @@ jobs:
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
-          # 12.6.3 was de-listed by NVIDIA; 12.8.0 is current and stable.
-          cuda: '12.8.0'
+          # v0.2.19's hardcoded version list tops out at 12.6.2; later
+          # versions (12.6.3, 12.8.x) are not wired in even when their
+          # installer is still on NVIDIA's CDN.
+          cuda: '12.6.2'
           method: network
 
       - name: Setup Rust
