@@ -191,10 +191,6 @@ jobs:
           # Names verified against llama.cpp's CUDA workflow on the same
           # action version.
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
-          # Driver/dkms is irrelevant on a headless runner (and crashes
-          # nvidia-dkms-560-open during dpkg --configure). Install only
-          # the build-time pieces ggml-cuda needs.
-          sub-packages: '["nvcc", "cudart", "cudart-dev", "cublas", "cublas-dev", "cuda-driver-dev"]'
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
