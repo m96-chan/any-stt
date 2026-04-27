@@ -78,14 +78,17 @@ impl SttEngine for ReazonSpeechEngine {
         if audio.is_empty() {
             return Err(SttError::InvalidAudio("empty audio buffer".into()));
         }
-        // TODO(#N4): mel → encoder → decoder → tokenizer pipeline.
-        Err(SttError::NotImplemented(format!(
-            "ReazonSpeechEngine::transcribe not yet implemented — \
-             loaded {}, backend={:?}, language={}",
-            self.model_path.display(),
-            self.backend,
-            self.language,
-        )))
+        // ReazonSpeech v2 uses Longformer attention which the
+        // fastconformer-core encoder doesn't yet implement. Surface a
+        // clear error so callers know what's missing rather than letting
+        // the encoder fall through to the vanilla rel-pos path.
+        Err(SttError::NotImplemented(
+            "ReazonSpeech transcribe requires Longformer (rel_pos_local_attn) \
+             attention, which fastconformer-core does not yet implement. \
+             The full mel → encoder → decoder → tokenizer pipeline is wired \
+             and will activate once Longformer is added."
+                .into(),
+        ))
     }
 
     fn is_ready(&self) -> bool {
@@ -156,7 +159,7 @@ mod tests {
         let audio = vec![0.0_f32; 16000];
         match engine.transcribe(&audio) {
             Err(SttError::NotImplemented(msg)) => {
-                assert!(msg.contains("ReazonSpeechEngine"));
+                assert!(msg.contains("Longformer"), "got: {msg}");
             }
             Err(e) => panic!("expected NotImplemented, got {e}"),
             Ok(_) => panic!("expected NotImplemented, got Ok"),

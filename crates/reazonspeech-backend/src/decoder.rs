@@ -24,9 +24,8 @@
 //! core for d=640) and loop-heavy — NPU offload does not pay off.
 
 use fastconformer_core::Config;
+use fastconformer_core::encoder::EncoderOutput;
 use gguf_loader::GgufFile;
-
-use crate::encoder::EncoderOutput;
 
 /// One LSTM layer.
 struct LstmLayer {
