@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
+use crate::model::{Model, WhisperVariant};
+
 /// Configuration for initializing an STT engine.
 #[derive(Debug, Clone)]
 pub struct SttConfig {
     /// Language code (e.g. "ja", "en").
     pub language: String,
-    /// Whisper model variant to use.
+    /// Model to load. See [`Model`] for available families and variants.
     pub model: Model,
     /// Override: custom model file path.
     pub model_path: Option<PathBuf>,
@@ -23,7 +25,7 @@ impl Default for SttConfig {
     fn default() -> Self {
         Self {
             language: "en".into(),
-            model: Model::Small,
+            model: Model::Whisper(WhisperVariant::Small),
             model_path: None,
             quantization: None,
             backend: None,
@@ -33,32 +35,12 @@ impl Default for SttConfig {
     }
 }
 
-/// Whisper model variants.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Model {
-    Tiny,
-    TinyEn,
-    Base,
-    BaseEn,
-    Small,
-    SmallEn,
-    Medium,
-    MediumEn,
-    LargeV1,
-    LargeV2,
-    LargeV3,
-    LargeV3Turbo,
-    DistilLargeV2,
-    DistilLargeV3,
-    DistilMediumEn,
-    DistilSmallEn,
-    KotobaV1,
-    KotobaV2,
-    /// Custom model specified by HuggingFace model ID.
-    Custom(String),
-}
-
-/// Quantization formats for ggml models.
+/// GGUF / ggml quantization formats.
+///
+/// These are shared across all families that load weights through ggml
+/// (Whisper, FastConformer-based families, Qwen3 LLM). If a family introduces
+/// its own quantization scheme (e.g. GPTQ/AWQ for LLM-only paths) it should
+/// extend this enum rather than bypass it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quantization {
     F16,

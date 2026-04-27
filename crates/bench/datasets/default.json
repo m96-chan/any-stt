@@ -1,0 +1,18 @@
+{
+  "name": "any-stt default accuracy bench",
+  "sample_rate": 16000,
+  "items": [
+    {
+      "id": "jfk_en",
+      "audio": "../../../third-party/whisper.cpp/samples/jfk.wav",
+      "language": "en",
+      "reference": "And so, my fellow Americans, ask not what your country can do for you — ask what you can do for your country."
+    },
+    {
+      "id": "wagahai_ja",
+      "audio": "../../../third-party/whisper.cpp/samples/japanese_test.wav",
+      "language": "ja",
+      "reference": "我輩は猫である。名前はまだない。どこで生まれたかとんと見当がつかぬ。"
+    }
+  ]
+}
