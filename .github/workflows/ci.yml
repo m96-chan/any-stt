@@ -57,15 +57,14 @@ jobs:
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
-          # v0.2.19's hardcoded version list tops out at 12.6.2; later
-          # versions (12.6.3, 12.8.x) are not wired in even when their
-          # installer is still on NVIDIA's CDN.
+          # v0.2.19's hardcoded version list tops out at 12.6.2.
           cuda: '12.6.2'
-          method: network
-          # Driver/dkms is irrelevant on a headless runner (and crashes
-          # nvidia-dkms-560-open during dpkg --configure). Install only
-          # the build-time pieces ggml-cuda needs.
-          sub-packages: '["nvcc", "cudart", "cudart-dev", "cublas", "cublas-dev", "cuda-driver-dev"]'
+          # `method: local` runs cuda_installer-linux-*.run with the
+          # supplied args. `--toolkit` installs only nvcc / cudart /
+          # cublas / cu* libs, skipping the driver and dkms post-install
+          # that fails on headless GitHub runners with no GPU.
+          method: local
+          linux-local-args: '["--toolkit", "--silent", "--override"]'
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -186,11 +185,12 @@ jobs:
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
-          # v0.2.19's hardcoded version list tops out at 12.6.2; later
-          # versions (12.6.3, 12.8.x) are not wired in even when their
-          # installer is still on NVIDIA's CDN.
           cuda: '12.6.2'
           method: network
+          # Windows installer sub-package names use underscores, not dashes.
+          # Names verified against llama.cpp's CUDA workflow on the same
+          # action version.
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
           # Driver/dkms is irrelevant on a headless runner (and crashes
           # nvidia-dkms-560-open during dpkg --configure). Install only
           # the build-time pieces ggml-cuda needs.
