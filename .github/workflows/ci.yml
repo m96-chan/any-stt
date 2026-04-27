@@ -55,9 +55,10 @@ jobs:
           sudo apt-get install -y cmake libgomp1
 
       - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.18
+        uses: Jimver/cuda-toolkit@v0.2.19
         with:
-          cuda: '12.6.3'
+          # 12.6.3 was de-listed by NVIDIA; 12.8.0 is current and stable.
+          cuda: '12.8.0'
           method: network
 
       - name: Setup Rust
@@ -88,11 +89,13 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install NDK
-        run: sdkmanager "ndk;26.3.11579264"
+        # NDK r27 supports API 35; r26 caps at API 34 and breaks the
+        # `aarch64-linux-android35-clang` selector below.
+        run: sdkmanager "ndk;27.2.12479018"
 
       - name: Build for Android
         env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.3.11579264
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
         run: |
           NDK_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_TOOLCHAIN/bin/aarch64-linux-android35-clang"
@@ -120,10 +123,24 @@ jobs:
   test-windows:
     name: Test (Windows x86_64)
     runs-on: windows-latest
+    env:
+      # Use Ninja instead of MSBuild — MSBuild + the `\\?\` extended-length
+      # path prefix that cmake-rs emits on long target paths fails to open
+      # whisper.cpp/ggml/src/ggml.c. Ninja avoids the response-file path
+      # encoding that breaks under MSBuild.
+      CMAKE_GENERATOR: Ninja
+      # Keep target paths short so cmake doesn't fall back to extended-length.
+      CARGO_TARGET_DIR: C:\b
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Setup MSVC dev shell
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Ninja
+        run: choco install ninja -y
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -134,8 +151,8 @@ jobs:
           path: |
             ~\.cargo\registry
             ~\.cargo\git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            C:\b
+          key: ${{ runner.os }}-ninja-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build (CPU only)
         run: cargo build --workspace
@@ -146,15 +163,25 @@ jobs:
   build-windows-cuda:
     name: Build (Windows CUDA)
     runs-on: windows-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+      CARGO_TARGET_DIR: C:\b
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      - name: Setup MSVC dev shell
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
       - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.18
+        uses: Jimver/cuda-toolkit@v0.2.19
         with:
-          cuda: '12.6.3'
+          # 12.6.3 was de-listed by NVIDIA; 12.8.0 is current and stable.
+          cuda: '12.8.0'
           method: network
 
       - name: Setup Rust
