@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 any-stt = { path = "../any-stt" }
+fastconformer-core = { path = "../fastconformer-core" }
 gguf-loader = { path = "../gguf-loader" }
 thiserror = "2"
 

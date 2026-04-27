@@ -1,27 +1,35 @@
-//! RNN-T (Recurrent Neural Network Transducer) decoder.
+//! TDT (Token-Duration Transducer) decoder.
 //!
-//! Architecture:
-//!   - Prediction network: token embedding → LSTM stack → output [pred_hidden]
-//!   - Joint network:      tanh(enc_proj + pred_proj) → linear → vocab_size + 1 logits
-//!     (the +1 is the blank token; in metadata it's `cfg.blank_id`)
+//! TDT generalizes RNN-T: instead of stepping one encoder frame at a time,
+//! the joint network outputs both a token AND a duration token. The
+//! duration token says how many encoder frames to skip before the next
+//! decision. This roughly halves the number of frames the decoder visits
+//! at the same accuracy.
 //!
-//! Greedy decode loop:
+//! Joint output split:
+//!   logits[0..vocab_size+1]              — token logits (incl. blank)
+//!   logits[vocab_size+1..vocab_size+1+D] — duration logits (D = #durations)
+//!
+//! Greedy loop:
 //! ```text
 //!   t = 0
-//!   pred_state = lstm_init
-//!   pred_h = embedding(blank)
+//!   pred_h = 0
 //!   while t < n_frames:
 //!       loop:
 //!           logits = joint(enc[t], pred_h)
-//!           tok = argmax(logits)
-//!           if tok == blank: break
-//!           emit tok
-//!           pred_h = lstm_step(embedding(tok), pred_state)
-//!       t += 1
+//!           tok = argmax(logits[0..vocab+1])
+//!           dur = argmax(logits[vocab+1..])  // index into durations[]
+//!           if tok != blank:
+//!               emit tok
+//!               pred_h = lstm_step(embedding(tok), state)
+//!           if dur > 0 or tok == blank:
+//!               t += max(durations[dur], 1)
+//!               break  // advance frame
+//!   // edge case: if dur == 0 and tok != blank, stay on same frame
+//!   //            and emit again. Loop guarded by MAX_EMIT_PER_FRAME.
 //! ```
 //!
-//! All ops are pure CPU f32. The decoder is small (~5 ms / step on a fast
-//! core for d=640) and loop-heavy — NPU offload does not pay off.
+//! Reference: arxiv 2304.06795 "Token-and-Duration Transducer for ASR".
 
 use fastconformer_core::Config;
 use gguf_loader::GgufFile;
@@ -32,48 +40,95 @@ use crate::encoder::EncoderOutput;
 struct LstmLayer {
     input_size: usize,
     hidden_size: usize,
-    /// `[4 * hidden_size, input_size]` (gate order: i, f, g, o per torch).
     w_ih: Vec<f32>,
-    /// `[4 * hidden_size, hidden_size]`.
     w_hh: Vec<f32>,
-    /// `[4 * hidden_size]`.
     b_ih: Vec<f32>,
     b_hh: Vec<f32>,
 }
 
-/// Prediction network: embedding + multi-layer LSTM.
 pub struct PredictionNetwork {
-    /// `[vocab_size, pred_hidden]`. NeMo uses pred_hidden as both
-    /// embedding dim and hidden state size.
     embedding: Vec<f32>,
     pred_hidden: usize,
     vocab_size: usize,
     layers: Vec<LstmLayer>,
 }
 
-/// Joint network: tanh(W_enc·enc + W_pred·pred) → vocab+blank logits.
+/// TDT joint network: outputs both token and duration logits in one shot.
+/// Output layout: `[vocab_size + 1 (incl. blank), n_durations]` flattened
+/// as `[token_logits | duration_logits]`.
 pub struct JointNetwork {
-    /// `[joint_hidden, encoder_dim]`
     w_enc: Vec<f32>,
-    /// `[joint_hidden]`
     b_enc: Vec<f32>,
-    /// `[joint_hidden, pred_hidden]`
     w_pred: Vec<f32>,
-    /// `[joint_hidden]`
     b_pred: Vec<f32>,
-    /// `[vocab_size + 1, joint_hidden]`
     w_out: Vec<f32>,
-    /// `[vocab_size + 1]`
     b_out: Vec<f32>,
     joint_hidden: usize,
     encoder_dim: usize,
     pred_hidden: usize,
     vocab_size_with_blank: usize,
+    n_durations: usize,
 }
 
-/// Hidden state across an LSTM stack.
+impl JointNetwork {
+    fn out_dim(&self) -> usize {
+        self.vocab_size_with_blank + self.n_durations
+    }
+
+    fn forward(&self, enc: &[f32], pred: &[f32]) -> Vec<f32> {
+        debug_assert_eq!(enc.len(), self.encoder_dim);
+        debug_assert_eq!(pred.len(), self.pred_hidden);
+        let mut hidden = vec![0.0_f32; self.joint_hidden];
+        matvec_add(&self.w_enc, enc, &mut hidden);
+        for j in 0..self.joint_hidden {
+            hidden[j] += self.b_enc[j];
+        }
+        let mut pp = vec![0.0_f32; self.joint_hidden];
+        matvec_add(&self.w_pred, pred, &mut pp);
+        for j in 0..self.joint_hidden {
+            hidden[j] = (hidden[j] + pp[j] + self.b_pred[j]).tanh();
+        }
+        let total = self.out_dim();
+        let mut out = vec![0.0_f32; total];
+        matvec_add(&self.w_out, &hidden, &mut out);
+        for j in 0..total {
+            out[j] += self.b_out[j];
+        }
+        out
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_test_weights(
+        encoder_dim: usize,
+        pred_hidden: usize,
+        joint_hidden: usize,
+        vocab_size_with_blank: usize,
+        n_durations: usize,
+        w_enc: Vec<f32>,
+        b_enc: Vec<f32>,
+        w_pred: Vec<f32>,
+        b_pred: Vec<f32>,
+        w_out: Vec<f32>,
+        b_out: Vec<f32>,
+    ) -> Self {
+        Self {
+            w_enc,
+            b_enc,
+            w_pred,
+            b_pred,
+            w_out,
+            b_out,
+            joint_hidden,
+            encoder_dim,
+            pred_hidden,
+            vocab_size_with_blank,
+            n_durations,
+        }
+    }
+}
+
 struct LstmState {
-    /// One (h, c) pair per layer.
     layers: Vec<(Vec<f32>, Vec<f32>)>,
 }
 
@@ -88,29 +143,28 @@ impl LstmState {
     }
 }
 
-/// RNN-T decoder.
-pub struct RnntDecoder {
+/// TDT decoder.
+pub struct TdtDecoder {
     cfg: Config,
     pred: PredictionNetwork,
     joint: JointNetwork,
+    /// Duration values, e.g. `[0, 1, 2, 3, 4]` for parakeet-tdt-0.6b-v3.
+    durations: Vec<u32>,
 }
 
-impl RnntDecoder {
-    /// Build the decoder from a GGUF model. Not yet wired — needs the
-    /// real `dec.*` and `joint.*` tensor names which only solidify once
-    /// we run the converter on a real `.nemo` file.
+impl TdtDecoder {
     pub fn from_gguf(_gguf: &GgufFile, _cfg: Config) -> Result<Self, String> {
-        Err("RnntDecoder::from_gguf not yet implemented — \
-             needs `dec.rnn.*` and `joint.*` tensor wire-up"
+        Err("TdtDecoder::from_gguf not yet implemented — \
+             needs `dec.rnn.*`, `joint.*`, and `fastconformer.decoder.tdt_durations`"
             .into())
     }
 
-    /// Build a decoder directly from in-memory weights (used by unit tests
-    /// and for offline weight conversion).
+    /// Build from in-memory weights (used by tests).
     pub fn from_weights(
         cfg: Config,
         pred: PredictionNetwork,
         joint: JointNetwork,
+        durations: Vec<u32>,
     ) -> Result<Self, String> {
         if pred.pred_hidden != joint.pred_hidden {
             return Err(format!(
@@ -120,44 +174,63 @@ impl RnntDecoder {
         }
         if pred.vocab_size + 1 != joint.vocab_size_with_blank {
             return Err(format!(
-                "vocab mismatch: pred={} joint(includes blank)={}",
+                "vocab mismatch: pred={} joint={}",
                 pred.vocab_size, joint.vocab_size_with_blank
             ));
         }
-        Ok(Self { cfg, pred, joint })
+        if durations.len() != joint.n_durations {
+            return Err(format!(
+                "duration count mismatch: durations={} joint.n_durations={}",
+                durations.len(),
+                joint.n_durations
+            ));
+        }
+        Ok(Self {
+            cfg,
+            pred,
+            joint,
+            durations,
+        })
     }
 
-    /// Greedy RNN-T decode. Returns emitted token IDs (excluding blanks).
+    /// Greedy TDT decode.
     pub fn greedy_decode(&self, enc: &EncoderOutput) -> Vec<u32> {
         if enc.d_model != self.joint.encoder_dim {
             return Vec::new();
         }
         let blank = self.cfg.blank_id;
+        let vsb = self.joint.vocab_size_with_blank;
         let mut emitted = Vec::new();
         let mut state = LstmState::zeros(&self.pred.layers);
-        // Initial pred_h: zero vector (no token has been emitted yet).
-        // NeMo's RNN-T does the same — the LSTM is conditioned only on
-        // the sequence of *non-blank* emissions, and the joint network
-        // starts from zero state.
         let mut pred_h = vec![0.0_f32; self.pred.pred_hidden];
 
-        // Cap on emissions per frame to guard against degenerate models
-        // that would otherwise loop forever picking non-blank.
         const MAX_EMIT_PER_FRAME: usize = 30;
 
-        for t in 0..enc.n_frames {
+        let mut t = 0;
+        while t < enc.n_frames {
             let enc_frame = &enc.data[t * enc.d_model..(t + 1) * enc.d_model];
             let mut emits = 0;
             loop {
                 let logits = self.joint.forward(enc_frame, &pred_h);
-                let tok = argmax(&logits) as u32;
-                if tok == blank {
+                let tok = argmax(&logits[..vsb]) as u32;
+                let dur_idx = argmax(&logits[vsb..]);
+                let dur = self.durations[dur_idx];
+
+                if tok != blank {
+                    emitted.push(tok);
+                    pred_h = self.pred.forward(tok, &mut state);
+                }
+                emits += 1;
+
+                // TDT advance rules:
+                //   dur > 0  OR  tok == blank → advance by `dur` frames
+                //   dur == 0 AND tok != blank → stay on same frame (re-emit)
+                if dur > 0 || tok == blank {
+                    t += dur.max(1) as usize;
                     break;
                 }
-                emitted.push(tok);
-                pred_h = self.pred.forward(tok, &mut state);
-                emits += 1;
                 if emits >= MAX_EMIT_PER_FRAME {
+                    t += 1; // forced advance to break runaway loops
                     break;
                 }
             }
@@ -172,7 +245,6 @@ impl RnntDecoder {
 }
 
 impl PredictionNetwork {
-    /// Constructor for hand-built test weights.
     #[doc(hidden)]
     pub fn from_test_weights(
         embedding: Vec<f32>,
@@ -199,8 +271,6 @@ impl PredictionNetwork {
         }
     }
 
-    /// Run one prediction step (embed + LSTM stack). Returns the top
-    /// layer's hidden state.
     fn forward(&self, token: u32, state: &mut LstmState) -> Vec<f32> {
         debug_assert!((token as usize) < self.vocab_size);
         let s = (token as usize) * self.pred_hidden;
@@ -236,7 +306,6 @@ impl LstmLayer {
         for i in 0..h4 {
             gates[i] += self.b_hh[i];
         }
-        // torch order: i, f, g, o
         let hs = self.hidden_size;
         let (gi, gf, gg, go) = (
             &gates[0..hs],
@@ -256,63 +325,6 @@ impl LstmLayer {
     }
 }
 
-impl JointNetwork {
-    #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_test_weights(
-        encoder_dim: usize,
-        pred_hidden: usize,
-        joint_hidden: usize,
-        vocab_size_with_blank: usize,
-        w_enc: Vec<f32>,
-        b_enc: Vec<f32>,
-        w_pred: Vec<f32>,
-        b_pred: Vec<f32>,
-        w_out: Vec<f32>,
-        b_out: Vec<f32>,
-    ) -> Self {
-        Self {
-            w_enc,
-            b_enc,
-            w_pred,
-            b_pred,
-            w_out,
-            b_out,
-            joint_hidden,
-            encoder_dim,
-            pred_hidden,
-            vocab_size_with_blank,
-        }
-    }
-
-    /// `joint(enc, pred) = w_out · tanh(W_enc·enc + b_enc + W_pred·pred + b_pred) + b_out`
-    fn forward(&self, enc: &[f32], pred: &[f32]) -> Vec<f32> {
-        debug_assert_eq!(enc.len(), self.encoder_dim);
-        debug_assert_eq!(pred.len(), self.pred_hidden);
-        let mut hidden = vec![0.0_f32; self.joint_hidden];
-        matvec_add(&self.w_enc, enc, &mut hidden);
-        for j in 0..self.joint_hidden {
-            hidden[j] += self.b_enc[j];
-        }
-        let mut pp = vec![0.0_f32; self.joint_hidden];
-        matvec_add(&self.w_pred, pred, &mut pp);
-        for j in 0..self.joint_hidden {
-            hidden[j] = (hidden[j] + pp[j] + self.b_pred[j]).tanh();
-        }
-        let mut out = vec![0.0_f32; self.vocab_size_with_blank];
-        matvec_add(&self.w_out, &hidden, &mut out);
-        for j in 0..self.vocab_size_with_blank {
-            out[j] += self.b_out[j];
-        }
-        out
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Math helpers (scalar f32; replaceable with ggml/SIMD later).
-// ---------------------------------------------------------------------------
-
-/// `out += W · x` where W is `[rows, cols]` row-major.
 fn matvec_add(w: &[f32], x: &[f32], out: &mut [f32]) {
     let rows = out.len();
     let cols = x.len();
@@ -348,19 +360,23 @@ fn argmax(v: &[f32]) -> usize {
 mod tests {
     use super::*;
 
-    fn make_decoder(force_blank: bool, vocab_size: usize) -> RnntDecoder {
+    fn make_decoder(force_token: Option<u32>, force_dur_idx: usize) -> TdtDecoder {
         let enc_dim = 4;
         let pred_h = 3;
         let joint_h = 5;
+        let vocab_size = 4;
+        let durations: Vec<u32> = vec![0, 1, 2, 3, 4];
+        let n_dur = durations.len();
+        let blank = vocab_size as u32;
+        let vsb = vocab_size + 1;
 
-        // Embedding: token i → vector of i*0.1 + k*0.01 (deterministic).
+        // Embedding rows for tokens 0..vocab_size.
         let mut emb = vec![0.0_f32; vocab_size * pred_h];
         for tok in 0..vocab_size {
             for k in 0..pred_h {
                 emb[tok * pred_h + k] = (tok as f32) * 0.1 + (k as f32) * 0.01;
             }
         }
-        // Single LSTM layer with zero weights — pred state stays at 0.
         let layers = vec![LstmLayerWeights {
             input_size: pred_h,
             hidden_size: pred_h,
@@ -371,30 +387,31 @@ mod tests {
         }];
         let pred = PredictionNetwork::from_test_weights(emb, pred_h, vocab_size, layers);
 
-        let blank = vocab_size; // last index is blank in joint output
-        let vsb = vocab_size + 1;
+        let total_out = vsb + n_dur;
         let w_enc = vec![0.0; joint_h * enc_dim];
         let b_enc = vec![0.0; joint_h];
         let w_pred = vec![0.0; joint_h * pred_h];
         let b_pred = vec![0.0; joint_h];
-        let w_out = vec![0.0_f32; vsb * joint_h];
-        let mut b_out = vec![0.0_f32; vsb];
-        if force_blank {
-            b_out[blank] = 100.0;
-        } else {
-            b_out[1] = 100.0;
-        }
+        let w_out = vec![0.0; total_out * joint_h];
+        let mut b_out = vec![0.0_f32; total_out];
+
+        // Force the desired token (or blank if None).
+        let tok = force_token.unwrap_or(blank);
+        b_out[tok as usize] = 100.0;
+        // Force the desired duration index.
+        b_out[vsb + force_dur_idx] = 100.0;
+
         let joint = JointNetwork::from_test_weights(
-            enc_dim, pred_h, joint_h, vsb, w_enc, b_enc, w_pred, b_pred, w_out, b_out,
+            enc_dim, pred_h, joint_h, vsb, n_dur, w_enc, b_enc, w_pred, b_pred, w_out, b_out,
         );
 
-        let mut cfg = Config::dummy_reazonspeech_nemo_v2();
+        let mut cfg = Config::dummy_parakeet_tdt_v3();
         cfg.vocab_size = vocab_size as u32;
-        cfg.blank_id = blank as u32;
+        cfg.blank_id = blank;
         cfg.pred_hidden = pred_h as u32;
         cfg.joint_hidden = joint_h as u32;
 
-        RnntDecoder::from_weights(cfg, pred, joint).unwrap()
+        TdtDecoder::from_weights(cfg, pred, joint, durations).unwrap()
     }
 
     fn dummy_enc(n_frames: usize, dim: usize) -> EncoderOutput {
@@ -406,43 +423,66 @@ mod tests {
     }
 
     #[test]
-    fn forced_blank_emits_nothing() {
-        let dec = make_decoder(true, 4);
+    fn blank_with_zero_dur_advances_one_frame() {
+        // tok=blank, dur_idx=0 (=duration 0). Per TDT rule:
+        // dur==0 but tok==blank → advance by max(dur, 1) = 1 frame. So
+        // 5 frames → 5 iterations, each advancing 1. No emissions.
+        let dec = make_decoder(None, 0);
         let enc = dummy_enc(5, 4);
         let out = dec.greedy_decode(&enc);
         assert!(out.is_empty());
     }
 
     #[test]
-    fn forced_token_emits_per_frame_capped() {
-        let dec = make_decoder(false, 4);
+    fn token_with_duration_2_emits_then_skips() {
+        // tok=1, dur_idx=2 (=duration 2). Per frame: emit tok=1 then
+        // advance by 2 frames. n_frames=6 → t goes 0, 2, 4, 6 (stop).
+        // So 3 emissions of token 1.
+        let dec = make_decoder(Some(1), 2);
+        let enc = dummy_enc(6, 4);
+        let out = dec.greedy_decode(&enc);
+        assert_eq!(out, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn token_with_duration_4_skips_aggressively() {
+        // tok=2, dur_idx=4 (=duration 4). t goes 0, 4 (stop, 8 > 5).
+        // 2 emissions of token 2.
+        let dec = make_decoder(Some(2), 4);
+        let enc = dummy_enc(5, 4);
+        let out = dec.greedy_decode(&enc);
+        assert_eq!(out, vec![2, 2]);
+    }
+
+    #[test]
+    fn token_with_duration_zero_re_emits_until_capped() {
+        // tok=3, dur_idx=0 (=duration 0). dur==0 AND tok != blank →
+        // re-emit on same frame. Capped at MAX_EMIT_PER_FRAME=30, then
+        // forced advance by 1.
+        let dec = make_decoder(Some(3), 0);
         let enc = dummy_enc(2, 4);
         let out = dec.greedy_decode(&enc);
-        // Each frame triggers MAX_EMIT_PER_FRAME (=30) emits because the
-        // joint always picks token 1 — never blank. 2 frames × 30 = 60.
-        assert_eq!(out.len(), 60);
-        assert!(out.iter().all(|&t| t == 1));
+        assert_eq!(out.len(), 60); // 2 frames × 30 cap each
+        assert!(out.iter().all(|&t| t == 3));
     }
 
     #[test]
     fn empty_encoder_emits_nothing() {
-        let dec = make_decoder(false, 4);
+        let dec = make_decoder(Some(1), 1);
         let enc = dummy_enc(0, 4);
-        let out = dec.greedy_decode(&enc);
-        assert!(out.is_empty());
+        assert!(dec.greedy_decode(&enc).is_empty());
     }
 
     #[test]
     fn encoder_dim_mismatch_returns_empty() {
-        let dec = make_decoder(false, 4);
+        let dec = make_decoder(Some(1), 1);
         let enc = dummy_enc(3, 99);
-        let out = dec.greedy_decode(&enc);
-        assert!(out.is_empty());
+        assert!(dec.greedy_decode(&enc).is_empty());
     }
 
     #[test]
-    fn from_weights_rejects_pred_dim_mismatch() {
-        let cfg = Config::dummy_reazonspeech_nemo_v2();
+    fn from_weights_rejects_duration_count_mismatch() {
+        let cfg = Config::dummy_parakeet_tdt_v3();
         let pred = PredictionNetwork::from_test_weights(
             vec![0.0; 4 * 3],
             3,
@@ -450,58 +490,26 @@ mod tests {
             vec![LstmLayerWeights {
                 input_size: 3,
                 hidden_size: 3,
-                w_ih: vec![0.0; 4 * 3 * 3],
-                w_hh: vec![0.0; 4 * 3 * 3],
+                w_ih: vec![0.0; 36],
+                w_hh: vec![0.0; 36],
                 b_ih: vec![0.0; 12],
                 b_hh: vec![0.0; 12],
             }],
         );
         let joint = JointNetwork::from_test_weights(
             4,
-            7, // wrong: should be 3
+            3,
             5,
             5,
+            5, // expects 5 durations
             vec![0.0; 5 * 4],
             vec![0.0; 5],
-            vec![0.0; 5 * 7],
+            vec![0.0; 5 * 3],
             vec![0.0; 5],
-            vec![0.0; 5 * 5],
-            vec![0.0; 5],
+            vec![0.0; (5 + 5) * 5],
+            vec![0.0; 5 + 5],
         );
-        assert!(RnntDecoder::from_weights(cfg, pred, joint).is_err());
-    }
-
-    #[test]
-    fn lstm_step_zero_weights_preserves_zero_state() {
-        let layer = LstmLayer {
-            input_size: 3,
-            hidden_size: 3,
-            w_ih: vec![0.0; 36],
-            w_hh: vec![0.0; 36],
-            b_ih: vec![0.0; 12],
-            b_hh: vec![0.0; 12],
-        };
-        let mut h = vec![0.0; 3];
-        let mut c = vec![0.0; 3];
-        let new_h = layer.step(&[0.1, 0.2, 0.3], &mut h, &mut c);
-        // gates all zero → i=σ(0)=0.5, f=0.5, g=tanh(0)=0, o=0.5
-        // c = 0.5*0 + 0.5*0 = 0
-        // h = 0.5 * tanh(0) = 0
-        assert!(new_h.iter().all(|&v| v.abs() < 1e-6));
-    }
-
-    #[test]
-    fn matvec_add_basic() {
-        let w = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let x = vec![1.0, 1.0, 1.0];
-        let mut out = vec![0.0_f32; 2];
-        matvec_add(&w, &x, &mut out);
-        assert_eq!(out, vec![6.0, 15.0]);
-    }
-
-    #[test]
-    fn argmax_returns_index_of_max() {
-        assert_eq!(argmax(&[1.0, 5.0, 3.0, 5.0, 2.0]), 1);
-        assert_eq!(argmax(&[7.0]), 0);
+        // Pass only 3 durations — should error.
+        assert!(TdtDecoder::from_weights(cfg, pred, joint, vec![0, 1, 2]).is_err());
     }
 }

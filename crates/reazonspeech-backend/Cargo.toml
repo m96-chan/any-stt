@@ -9,12 +9,9 @@ authors.workspace = true
 
 [dependencies]
 any-stt = { path = "../any-stt" }
+fastconformer-core = { path = "../fastconformer-core" }
 gguf-loader = { path = "../gguf-loader" }
 thiserror = "2"
-# Real-valued FFT for log-mel spectrogram. realfft wraps rustfft and is
-# both ~30% faster on real input and avoids allocating the complex half
-# of the symmetric output.
-realfft = "3"
 
 [features]
 # NPU-first path (Snapdragon QNN / generic NNAPI).

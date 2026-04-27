@@ -34,8 +34,8 @@
 //! - LayerNorm + softmax + residuals → CPU
 //! - Positional bias (pos_bias_u/v) → CPU (small)
 
-use crate::config::ReazonSpeechConfig;
-use crate::mel::MelSpectrogram;
+use fastconformer_core::Config;
+use fastconformer_core::MelSpectrogram;
 
 /// Encoder output: acoustic representation ready for the RNN-T joint network.
 ///
@@ -51,7 +51,7 @@ pub struct EncoderOutput {
 /// Holds dequantized weights + any NPU graph handles. Thread-safe as long
 /// as `forward` is not called concurrently on the same instance.
 pub struct FastConformerEncoder {
-    cfg: ReazonSpeechConfig,
+    cfg: Config,
     // TODO(#N4): fields for weights + optional NPU graph handle
 }
 
@@ -62,7 +62,7 @@ impl FastConformerEncoder {
     /// Returns a descriptive error if expected tensors are missing.
     pub fn from_gguf(
         _gguf: &gguf_loader::GgufFile,
-        cfg: ReazonSpeechConfig,
+        cfg: Config,
     ) -> Result<Self, String> {
         // TODO(#N4): dequantize all encoder.* tensors and cache.
         //   For each layer L in 0..cfg.n_layers, load:
@@ -90,7 +90,7 @@ impl FastConformerEncoder {
         Err("FastConformerEncoder::forward not yet implemented".into())
     }
 
-    pub fn config(&self) -> &ReazonSpeechConfig {
+    pub fn config(&self) -> &Config {
         &self.cfg
     }
 }
