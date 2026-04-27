@@ -38,9 +38,14 @@
 //!         t += max(duration, 1)
 //! ```
 
+pub mod decoder;
+pub mod encoder;
+
 use std::path::{Path, PathBuf};
 
 use any_stt::{Backend, HardwareInfo, SttEngine, SttError, SttResult};
+
+pub use fastconformer_core::Config as ParakeetConfig;
 
 pub struct ParakeetEngine {
     model_path: PathBuf,

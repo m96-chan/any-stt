@@ -23,7 +23,7 @@ use std::f32::consts::PI;
 
 use realfft::RealFftPlanner;
 
-use crate::config::ReazonSpeechConfig;
+use crate::config::Config;
 
 /// Mel spectrogram in row-major `[n_frames, n_mels]` layout.
 pub struct MelSpectrogram {
@@ -48,7 +48,7 @@ const LOG_ZERO_GUARD: f32 = 1e-5;
 ///
 /// Audio is assumed to be 16 kHz mono f32 in [-1, 1]. Out-of-range values
 /// are not clamped — that is the caller's responsibility.
-pub fn log_mel_spectrogram(audio: &[f32], cfg: &ReazonSpeechConfig) -> MelSpectrogram {
+pub fn log_mel_spectrogram(audio: &[f32], cfg: &Config) -> MelSpectrogram {
     assert_eq!(
         cfg.sample_rate, 16000,
         "only 16 kHz sample rate is wired; got {}",
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn frame_count_matches_formula() {
-        let cfg = ReazonSpeechConfig::dummy();
+        let cfg = Config::dummy_reazonspeech_nemo_v2();
         // 1s @ 16kHz, win=400, hop=160 → (16000-400)/160 + 1 = 98 frames.
         let audio = vec![0.0_f32; 16000];
         let mel = log_mel_spectrogram(&audio, &cfg);
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn short_audio_returns_single_frame() {
-        let cfg = ReazonSpeechConfig::dummy();
+        let cfg = Config::dummy_reazonspeech_nemo_v2();
         let mel = log_mel_spectrogram(&[0.0_f32; 100], &cfg);
         assert_eq!(mel.n_frames, 1);
         assert_eq!(mel.n_mels, 80);
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn silent_audio_yields_finite_normalized_output() {
-        let cfg = ReazonSpeechConfig::dummy();
+        let cfg = Config::dummy_reazonspeech_nemo_v2();
         let audio = vec![0.0_f32; 16000];
         let mel = log_mel_spectrogram(&audio, &cfg);
         // After per-feature normalization of constant input, each row is
@@ -305,7 +305,7 @@ mod tests {
         // time means normalize zeros everything) — instead, run the
         // transform and inspect the *first* frame's pre-normalize energy
         // by re-running without normalize.
-        let cfg = ReazonSpeechConfig::dummy();
+        let cfg = Config::dummy_reazonspeech_nemo_v2();
         let n = 16000;
         let freq = 1000.0_f32;
         let audio: Vec<f32> = (0..n)

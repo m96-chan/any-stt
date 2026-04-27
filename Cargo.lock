@@ -69,6 +69,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
+name = "fastconformer-core"
+version = "0.1.0"
+dependencies = [
+ "gguf-loader",
+ "realfft",
+ "thiserror",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -175,6 +184,7 @@ name = "parakeet-backend"
 version = "0.1.0"
 dependencies = [
  "any-stt",
+ "fastconformer-core",
  "gguf-loader",
  "thiserror",
 ]
@@ -236,8 +246,8 @@ name = "reazonspeech-backend"
 version = "0.1.0"
 dependencies = [
  "any-stt",
+ "fastconformer-core",
  "gguf-loader",
- "realfft",
  "thiserror",
 ]
 

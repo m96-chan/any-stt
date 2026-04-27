@@ -1,55 +1,36 @@
 //! ReazonSpeech backend for any-stt.
 //!
-//! Target model: **reazonspeech-nemo-v2** (FastConformer encoder with
-//! Longformer attention + RNN-T decoder). 619M parameters, SentencePiece
-//! unigram tokenizer (3,000 tokens), Japanese only.
+//! Target: **reazonspeech-nemo-v2** — FastConformer encoder with Longformer
+//! attention + RNN-T decoder. 619M params, SentencePiece unigram (3,000
+//! tokens), Japanese.
 //!
 //! Upstream:
 //! - <https://huggingface.co/reazon-research/reazonspeech-nemo-v2>
 //! - <https://research.reazon.jp/projects/ReazonSpeech/index.html>
 //!
-//! # Architecture (file layout matches the inference pipeline)
-//!
+//! # File layout
 //! ```text
-//!   audio PCM (16 kHz mono)
-//!     │
-//!     ▼
-//!   mel.rs        — log-mel filterbank (n_mels=80, win=400, hop=160)
-//!     │
-//!     ▼
-//!   encoder.rs    — FastConformer, subsampling ×8, Longformer attn
-//!     │
-//!     ▼
-//!   decoder.rs    — RNN-T prediction + joint network, greedy beam
-//!     │
-//!     ▼
-//!   tokenizer.rs  — SentencePiece detokenize → Japanese text
+//! lib.rs       — engine (this file)
+//! encoder.rs   — FastConformer-Longformer wrapper
+//! decoder.rs   — RNN-T greedy
 //! ```
+//!
+//! Audio preprocessing (log-mel) and tokenization (SentencePiece) live
+//! in `fastconformer-core`, shared with `parakeet-backend`.
 //!
 //! # Status
 //!
-//! Skeleton. `ReazonSpeechEngine::transcribe` currently returns
-//! `SttError::NotImplemented`. Each submodule documents the concrete
-//! work remaining before a round-trip transcription is possible.
-//!
-//! # NPU strategy (from project constraints)
-//!
-//! - Encoder MatMul is the hot path → offloaded to `qnn-backend` /
-//!   `nnapi-backend` on Android. CPU fallback via ggml FFI.
-//! - LayerNorm / Softmax / positional bias stay on CPU (NPU-unfriendly).
-//! - Decoder (RNN-T) runs on CPU — small ops, loop-heavy, not NPU-shaped.
+//! Skeleton + decoder primitives. `transcribe()` returns
+//! `SttError::NotImplemented` until the encoder forward pass lands.
 
-pub mod config;
 pub mod decoder;
 pub mod encoder;
-pub mod mel;
-pub mod tokenizer;
 
 use std::path::{Path, PathBuf};
 
 use any_stt::{Backend, HardwareInfo, SttEngine, SttError, SttResult};
 
-pub use config::ReazonSpeechConfig;
+pub use fastconformer_core::Config as ReazonSpeechConfig;
 
 /// ReazonSpeech-NeMo-v2 engine.
 pub struct ReazonSpeechEngine {
@@ -61,9 +42,6 @@ pub struct ReazonSpeechEngine {
 }
 
 impl ReazonSpeechEngine {
-    /// Load a reazonspeech-nemo-v2 GGUF model.
-    ///
-    /// Expects `model_path.tokenizer.model` alongside the `.gguf` file.
     pub fn new(
         model_path: &Path,
         language: &str,
@@ -75,15 +53,12 @@ impl ReazonSpeechEngine {
                 path: model_path.to_path_buf(),
             });
         }
-
         let gguf = gguf_loader::GgufFile::open(model_path).map_err(|e| {
             SttError::TranscriptionFailed(format!("gguf open failed: {e}"))
         })?;
-
         let config = ReazonSpeechConfig::from_gguf(&gguf).map_err(|e| {
             SttError::TranscriptionFailed(format!("invalid model: {e}"))
         })?;
-
         Ok(Self {
             model_path: model_path.to_path_buf(),
             config,
@@ -103,16 +78,10 @@ impl SttEngine for ReazonSpeechEngine {
         if audio.is_empty() {
             return Err(SttError::InvalidAudio("empty audio buffer".into()));
         }
-
-        // TODO(#N4): implement inference.
-        //   1. mel::log_mel_spectrogram(audio)
-        //   2. encoder::forward(&mel) — FastConformer + Longformer attn
-        //   3. decoder::rnnt_greedy_decode(&enc_out) — RNN-T greedy
-        //   4. tokenizer::detokenize(&token_ids)
+        // TODO(#N4): mel → encoder → decoder → tokenizer pipeline.
         Err(SttError::NotImplemented(format!(
             "ReazonSpeechEngine::transcribe not yet implemented — \
-             model loaded from {}, backend={:?}, language={}, \
-             see crates/reazonspeech-backend/src/{{mel,encoder,decoder,tokenizer}}.rs",
+             loaded {}, backend={:?}, language={}",
             self.model_path.display(),
             self.backend,
             self.language,
@@ -120,8 +89,6 @@ impl SttEngine for ReazonSpeechEngine {
     }
 
     fn is_ready(&self) -> bool {
-        // Ready means: model file loaded + config parsed. Actual inference
-        // capability is signalled by the NotImplemented from transcribe().
         self.model_path.exists()
     }
 
@@ -134,19 +101,12 @@ impl SttEngine for ReazonSpeechEngine {
     }
 }
 
-/// Initialize a ReazonSpeech engine with auto-selected backend.
-///
-/// Equivalent to `whisper_backend::initialize` but for the ReazonSpeech
-/// family. `any_stt::initialize` directs callers here when the config's
-/// model family is `ModelFamily::ReazonSpeech`.
 pub fn initialize(config: &any_stt::SttConfig) -> Result<Box<dyn SttEngine>, SttError> {
     let model_path = config.model_path.as_ref().ok_or_else(|| {
         SttError::TranscriptionFailed("model_path is required".into())
     })?;
-
     let hw = any_stt::detect_hardware();
     let selection = any_stt::selector::select(config, &hw);
-
     let engine = ReazonSpeechEngine::new(model_path, &config.language, selection.backend, hw)?;
     Ok(Box::new(engine))
 }
@@ -169,9 +129,7 @@ mod tests {
 
     #[test]
     fn empty_audio_returns_invalid_audio() {
-        // Construct an engine with a dummy path — the audio check runs
-        // before any model access.
-        let cfg = ReazonSpeechConfig::dummy();
+        let cfg = fastconformer_core::Config::dummy_reazonspeech_nemo_v2();
         let hw = any_stt::detect_hardware();
         let engine = ReazonSpeechEngine {
             model_path: PathBuf::from("/dummy"),
@@ -186,7 +144,7 @@ mod tests {
 
     #[test]
     fn transcribe_currently_returns_not_implemented() {
-        let cfg = ReazonSpeechConfig::dummy();
+        let cfg = fastconformer_core::Config::dummy_reazonspeech_nemo_v2();
         let hw = any_stt::detect_hardware();
         let engine = ReazonSpeechEngine {
             model_path: PathBuf::from("/dummy"),
@@ -195,7 +153,7 @@ mod tests {
             backend: Backend::Cpu,
             language: "ja".into(),
         };
-        let audio = vec![0.0f32; 16000];
+        let audio = vec![0.0_f32; 16000];
         match engine.transcribe(&audio) {
             Err(SttError::NotImplemented(msg)) => {
                 assert!(msg.contains("ReazonSpeechEngine"));

@@ -1,0 +1,13 @@
+[package]
+name = "fastconformer-core"
+description = "Shared FastConformer ASR primitives — log-mel, SentencePiece, encoder building blocks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+gguf-loader = { path = "../gguf-loader" }
+realfft = "3"
+thiserror = "2"
