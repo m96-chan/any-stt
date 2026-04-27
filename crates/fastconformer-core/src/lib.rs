@@ -38,6 +38,7 @@
 //!   and rel-pos variants; the per-family crate decides which to use.
 
 pub mod config;
+pub mod encoder;
 pub mod mel;
 pub mod tokenizer;
 
