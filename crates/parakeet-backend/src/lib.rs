@@ -1,54 +1,51 @@
 //! NVIDIA Parakeet TDT backend for any-stt.
 //!
-//! Target model: **parakeet-tdt-0.6b-v3** (FastConformer + TDT). 600M
-//! parameters, SentencePiece (8,192 tokens), 25 European languages.
+//! Target: **parakeet-tdt-0.6b-v3** — FastConformer (rel-pos) + TDT,
+//! 600M params, SentencePiece (8,192 tokens), 25 European languages.
 //!
 //! ⚠️ **Japanese is NOT supported by this model.** For Japanese workloads
-//! use [`reazonspeech-backend`] or kotoba-whisper via `whisper-backend`.
+//! use `reazonspeech-backend` (when Longformer lands) or kotoba-whisper
+//! via `whisper-backend`.
 //!
 //! Upstream: <https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3>
 //!
-//! # Architecture
+//! # Pipeline
 //!
-//! Shares the FastConformer encoder with [`reazonspeech-backend`] (same
-//! `scripts/convert-nemo-to-gguf.py` produces GGUFs for both). The decoder
-//! is a **TDT (Token-Duration Transducer)** — an RNN-T generalization that
-//! emits a (token, duration) pair per step, skipping multiple encoder
-//! frames at once. Faster than RNN-T for the same accuracy.
+//! ```text
+//!   audio (f32, 16 kHz mono)
+//!     ↓ log_mel_spectrogram (fastconformer-core)
+//!   mel [time, n_mels]
+//!     ↓ FastConformerEncoder.forward
+//!   enc [time/8, d_model]
+//!     ↓ TdtDecoder.greedy_decode
+//!   token_ids [N]
+//!     ↓ SentencePieceTokenizer.detokenize
+//!   text
+//! ```
 //!
 //! # Status
 //!
-//! Skeleton. Decoder logic is independent from reazonspeech but the encoder
-//! forward is expected to share code once both crates pass CPU reference
-//! tests — at that point we extract `crates/fastconformer-core/`.
-//!
-//! # Decoder sketch (for when we come back to implement)
-//!
-//! ```text
-//! for each encoder frame t starting at t=0:
-//!     loop:
-//!         logits = joint(enc[t], pred_state)
-//!         token_logits = logits[:vocab]       // vocab_size + 1 for blank
-//!         dur_logits   = logits[vocab:]       // len(tdt_durations)
-//!         token = argmax(token_logits)
-//!         duration = tdt_durations[argmax(dur_logits)]
-//!         if token != blank:
-//!             emit token
-//!             pred_state = lstm_step(embedding(token), pred_state)
-//!         t += max(duration, 1)
-//! ```
+//! Encoder forward is wired (vanilla rel-pos in fastconformer-core).
+//! TDT decoder loader (`from_gguf`) is still stubbed, so transcribe
+//! returns NotImplemented from there. Tokenizer load is plumbed.
 
 pub mod decoder;
 pub mod encoder;
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use any_stt::{Backend, HardwareInfo, SttEngine, SttError, SttResult};
+use fastconformer_core::encoder::FastConformerEncoder;
+use fastconformer_core::{log_mel_spectrogram, SentencePieceTokenizer};
 
 pub use fastconformer_core::Config as ParakeetConfig;
 
 pub struct ParakeetEngine {
     model_path: PathBuf,
+    config: ParakeetConfig,
+    encoder: FastConformerEncoder,
+    tokenizer: Option<SentencePieceTokenizer>,
     hardware_info: HardwareInfo,
     backend: Backend,
     language: String,
@@ -66,20 +63,51 @@ impl ParakeetEngine {
                 path: model_path.to_path_buf(),
             });
         }
-        // Parakeet-TDT does not support Japanese / Korean / Chinese.
-        // We log but do not error — the caller may be using a custom fork.
         if matches!(language, "ja" | "ko" | "zh") {
             eprintln!(
-                "warning: parakeet-tdt-0.6b-v3 does not support language {language:?}; \
-                 consider reazonspeech-backend for Japanese"
+                "warning: parakeet-tdt-0.6b-v3 does not support language \
+                 {language:?}; consider reazonspeech-backend for Japanese"
             );
         }
+
+        let gguf = gguf_loader::GgufFile::open(model_path)
+            .map_err(|e| SttError::TranscriptionFailed(format!("gguf open: {e}")))?;
+        let config = ParakeetConfig::from_gguf(&gguf)
+            .map_err(|e| SttError::TranscriptionFailed(format!("config: {e}")))?;
+
+        let encoder = encoder::load(&gguf, config.clone())
+            .map_err(|e| SttError::TranscriptionFailed(format!("encoder load: {e}")))?;
+
+        // Tokenizer companion lives at "<model>.tokenizer.model" by
+        // convention (see `scripts/convert-nemo-to-gguf.py`).
+        let companion = model_path.with_extension("tokenizer.model");
+        let tokenizer = if companion.exists() {
+            Some(
+                SentencePieceTokenizer::load(&companion)
+                    .map_err(|e| SttError::TranscriptionFailed(format!("tokenizer: {e}")))?,
+            )
+        } else {
+            eprintln!(
+                "warning: tokenizer companion not found at {} — \
+                 transcribe will return token IDs instead of text",
+                companion.display()
+            );
+            None
+        };
+
         Ok(Self {
             model_path: model_path.to_path_buf(),
+            config,
+            encoder,
+            tokenizer,
             hardware_info,
             backend,
             language: language.to_string(),
         })
+    }
+
+    pub fn config(&self) -> &ParakeetConfig {
+        &self.config
     }
 }
 
@@ -88,13 +116,24 @@ impl SttEngine for ParakeetEngine {
         if audio.is_empty() {
             return Err(SttError::InvalidAudio("empty audio buffer".into()));
         }
-        // TODO(#N5): FastConformer encoder (shared w/ reazonspeech) → TDT decode.
+        let start = Instant::now();
+
+        let mel = log_mel_spectrogram(audio, &self.config);
+
+        let enc_out = self
+            .encoder
+            .forward(&mel.data, mel.n_frames)
+            .map_err(|e| SttError::TranscriptionFailed(format!("encoder forward: {e}")))?;
+
+        // TDT decoder needs a real GGUF loader (still stub). When it's
+        // wired up, replace this with `decoder.greedy_decode(&enc_out)`.
+        let _ = enc_out;
         Err(SttError::NotImplemented(format!(
-            "ParakeetEngine::transcribe not yet implemented — \
-             loaded {}, backend={:?}, language={}",
-            self.model_path.display(),
-            self.backend,
-            self.language,
+            "ParakeetEngine: encoder forward succeeded ({} frames @ {} d_model, {:.0}ms), \
+             but TDT decoder GGUF loader is not yet implemented",
+            mel.n_frames,
+            self.config.d_model,
+            start.elapsed().as_secs_f64() * 1000.0
         )))
     }
 

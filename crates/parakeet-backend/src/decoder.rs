@@ -32,9 +32,8 @@
 //! Reference: arxiv 2304.06795 "Token-and-Duration Transducer for ASR".
 
 use fastconformer_core::Config;
+use fastconformer_core::encoder::EncoderOutput;
 use gguf_loader::GgufFile;
-
-use crate::encoder::EncoderOutput;
 
 /// One LSTM layer.
 struct LstmLayer {
