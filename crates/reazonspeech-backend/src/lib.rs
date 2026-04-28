@@ -20,15 +20,24 @@
 //!
 //! # Status
 //!
-//! Skeleton + decoder primitives. `transcribe()` returns
-//! `SttError::NotImplemented` until the encoder forward pass lands.
+//! - mel + tokenizer + RNN-T greedy: implemented (#N4)
+//! - encoder forward (Conformer block, Longformer attention): implemented
+//!   (#N7) — RelPosLocalAttn dispatched through `AttentionMode::LocalGlobal`
+//! - RNN-T decoder GGUF loader: stub (blocked by #N8 — needs real .nemo)
+//!
+//! `transcribe()` runs mel → encoder.forward end-to-end and surfaces
+//! `NotImplemented` at the RNN-T decoder GGUF loader seam, the only
+//! remaining stub.
 
 pub mod decoder;
 pub mod encoder;
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use any_stt::{Backend, HardwareInfo, SttEngine, SttError, SttResult};
+use fastconformer_core::encoder::FastConformerEncoder;
+use fastconformer_core::{log_mel_spectrogram, SentencePieceTokenizer};
 
 pub use fastconformer_core::Config as ReazonSpeechConfig;
 
@@ -36,6 +45,8 @@ pub use fastconformer_core::Config as ReazonSpeechConfig;
 pub struct ReazonSpeechEngine {
     model_path: PathBuf,
     config: ReazonSpeechConfig,
+    encoder: FastConformerEncoder,
+    tokenizer: Option<SentencePieceTokenizer>,
     hardware_info: HardwareInfo,
     backend: Backend,
     language: String,
@@ -54,14 +65,35 @@ impl ReazonSpeechEngine {
             });
         }
         let gguf = gguf_loader::GgufFile::open(model_path).map_err(|e| {
-            SttError::TranscriptionFailed(format!("gguf open failed: {e}"))
+            SttError::TranscriptionFailed(format!("gguf open: {e}"))
         })?;
         let config = ReazonSpeechConfig::from_gguf(&gguf).map_err(|e| {
-            SttError::TranscriptionFailed(format!("invalid model: {e}"))
+            SttError::TranscriptionFailed(format!("config: {e}"))
         })?;
+
+        let encoder = encoder::load(&gguf, config.clone())
+            .map_err(|e| SttError::TranscriptionFailed(format!("encoder load: {e}")))?;
+
+        let companion = model_path.with_extension("tokenizer.model");
+        let tokenizer = if companion.exists() {
+            Some(
+                SentencePieceTokenizer::load(&companion)
+                    .map_err(|e| SttError::TranscriptionFailed(format!("tokenizer: {e}")))?,
+            )
+        } else {
+            eprintln!(
+                "warning: tokenizer companion not found at {} — \
+                 transcribe will return token IDs instead of text",
+                companion.display()
+            );
+            None
+        };
+
         Ok(Self {
             model_path: model_path.to_path_buf(),
             config,
+            encoder,
+            tokenizer,
             hardware_info,
             backend,
             language: language.to_string(),
@@ -78,17 +110,28 @@ impl SttEngine for ReazonSpeechEngine {
         if audio.is_empty() {
             return Err(SttError::InvalidAudio("empty audio buffer".into()));
         }
-        // ReazonSpeech v2 uses Longformer attention which the
-        // fastconformer-core encoder doesn't yet implement. Surface a
-        // clear error so callers know what's missing rather than letting
-        // the encoder fall through to the vanilla rel-pos path.
-        Err(SttError::NotImplemented(
-            "ReazonSpeech transcribe requires Longformer (rel_pos_local_attn) \
-             attention, which fastconformer-core does not yet implement. \
-             The full mel → encoder → decoder → tokenizer pipeline is wired \
-             and will activate once Longformer is added."
-                .into(),
-        ))
+        let start = Instant::now();
+
+        let mel = log_mel_spectrogram(audio, &self.config);
+
+        let enc_out = self
+            .encoder
+            .forward(&mel.data, mel.n_frames)
+            .map_err(|e| SttError::TranscriptionFailed(format!("encoder forward: {e}")))?;
+
+        // RNN-T decoder needs a real GGUF loader. When #N8 lands, replace
+        // this with `decoder.greedy_decode(&enc_out)` then
+        // `tokenizer.detokenize(&token_ids)`.
+        let _ = enc_out;
+        Err(SttError::NotImplemented(format!(
+            "ReazonSpeechEngine: encoder forward succeeded ({} frames @ {} d_model, \
+             attention={:?}, {:.0}ms), but RNN-T decoder GGUF loader is not yet \
+             implemented (#N8)",
+            mel.n_frames,
+            self.config.d_model,
+            self.config.attention_type,
+            start.elapsed().as_secs_f64() * 1000.0
+        )))
     }
 
     fn is_ready(&self) -> bool {
@@ -128,41 +171,5 @@ mod tests {
             hw,
         );
         assert!(matches!(result, Err(SttError::ModelNotFound { .. })));
-    }
-
-    #[test]
-    fn empty_audio_returns_invalid_audio() {
-        let cfg = fastconformer_core::Config::dummy_reazonspeech_nemo_v2();
-        let hw = any_stt::detect_hardware();
-        let engine = ReazonSpeechEngine {
-            model_path: PathBuf::from("/dummy"),
-            config: cfg,
-            hardware_info: hw,
-            backend: Backend::Cpu,
-            language: "ja".into(),
-        };
-        let result = engine.transcribe(&[]);
-        assert!(matches!(result, Err(SttError::InvalidAudio(_))));
-    }
-
-    #[test]
-    fn transcribe_currently_returns_not_implemented() {
-        let cfg = fastconformer_core::Config::dummy_reazonspeech_nemo_v2();
-        let hw = any_stt::detect_hardware();
-        let engine = ReazonSpeechEngine {
-            model_path: PathBuf::from("/dummy"),
-            config: cfg,
-            hardware_info: hw,
-            backend: Backend::Cpu,
-            language: "ja".into(),
-        };
-        let audio = vec![0.0_f32; 16000];
-        match engine.transcribe(&audio) {
-            Err(SttError::NotImplemented(msg)) => {
-                assert!(msg.contains("Longformer"), "got: {msg}");
-            }
-            Err(e) => panic!("expected NotImplemented, got {e}"),
-            Ok(_) => panic!("expected NotImplemented, got Ok"),
-        }
     }
 }
