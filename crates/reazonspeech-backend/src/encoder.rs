@@ -5,10 +5,11 @@
 //! naming. The encoder forward itself is shared with parakeet-backend.
 
 use fastconformer_core::encoder::{
-    ConformerBlock, ConvModule, FastConformerEncoder, FeedForward, MultiHeadAttention,
-    Subsample, subsampled_mel_dim,
+    AttentionMode, ConformerBlock, ConvModule, FastConformerEncoder, FeedForward,
+    MultiHeadAttention, Subsample, subsampled_mel_dim,
 };
 pub use fastconformer_core::encoder::EncoderOutput;
+use fastconformer_core::config::AttentionType;
 use fastconformer_core::Config;
 use gguf_loader::GgufFile;
 
@@ -53,9 +54,16 @@ pub fn load(gguf: &GgufFile, cfg: Config) -> Result<FastConformerEncoder, String
     };
 
     // --- Conformer blocks ---
+    let attn_mode = match cfg.attention_type {
+        AttentionType::RelPos => AttentionMode::Full,
+        AttentionType::RelPosLocalAttn => AttentionMode::LocalGlobal {
+            local_window: cfg.local_window as usize,
+            global_tokens: cfg.global_tokens as usize,
+        },
+    };
     let mut blocks = Vec::with_capacity(cfg.n_layers as usize);
     for l in 0..cfg.n_layers as usize {
-        let block = load_block(gguf, l, dm, n_heads, conv_kernel)?;
+        let block = load_block(gguf, l, dm, n_heads, conv_kernel, attn_mode)?;
         blocks.push(block);
     }
 
@@ -77,6 +85,7 @@ fn load_block(
     dm: usize,
     n_heads: usize,
     conv_kernel: usize,
+    attn_mode: AttentionMode,
 ) -> Result<ConformerBlock, String> {
     let pfx = format!("enc.block.{l}");
     let head_dim = dm / n_heads;
@@ -151,6 +160,7 @@ fn load_block(
     Ok(ConformerBlock {
         ff1,
         attn,
+        attn_mode,
         conv,
         ff2,
         ln_post_gamma: gguf.dequantize_f32(&format!("{pfx}.ln_post.weight"))?,

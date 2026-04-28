@@ -8,7 +8,7 @@
 //! x ← LN_post(x)
 //! ```
 
-use crate::encoder::attention::MultiHeadAttention;
+use crate::encoder::attention::{AttentionMode, MultiHeadAttention};
 use crate::encoder::conv_module::ConvModule;
 use crate::encoder::ff::FeedForward;
 use crate::encoder::ops::layer_norm_rows;
@@ -16,6 +16,9 @@ use crate::encoder::ops::layer_norm_rows;
 pub struct ConformerBlock {
     pub ff1: FeedForward,
     pub attn: MultiHeadAttention,
+    /// Attention pattern. `Full` for parakeet, `LocalGlobal` for
+    /// reazonspeech (Longformer).
+    pub attn_mode: AttentionMode,
     pub conv: ConvModule,
     pub ff2: FeedForward,
     /// Final LayerNorm γ (length d_model).
@@ -31,7 +34,7 @@ impl ConformerBlock {
     pub fn forward(&self, x: &mut [f32], time: usize) {
         debug_assert_eq!(x.len(), time * self.d_model);
         self.ff1.forward_residual(x, time);
-        self.attn.forward_residual(x, time);
+        self.attn.forward_residual_with_mode(x, time, self.attn_mode);
         self.conv.forward_residual(x, time);
         self.ff2.forward_residual(x, time);
         layer_norm_rows(

@@ -27,6 +27,24 @@
 
 use crate::encoder::ops::{layer_norm_rows, softmax_inplace};
 
+/// Which attention pattern to use.
+#[derive(Debug, Clone, Copy)]
+pub enum AttentionMode {
+    /// Standard full attention — every query attends to every key.
+    Full,
+    /// Longformer-style: each query attends to keys within a sliding
+    /// window plus a fixed number of "global" tokens that always attend
+    /// to/from everywhere. ReazonSpeech-NeMo-v2 uses this with
+    /// `local_window=256, global_tokens=1`.
+    LocalGlobal {
+        /// Window radius — query t attends to keys in [t-w, t+w].
+        local_window: usize,
+        /// Number of leading frames that act as global tokens. Global
+        /// tokens attend to all keys and are attended by all queries.
+        global_tokens: usize,
+    },
+}
+
 pub struct MultiHeadAttention {
     pub d_model: usize,
     pub n_heads: usize,
@@ -54,9 +72,19 @@ pub struct MultiHeadAttention {
 }
 
 impl MultiHeadAttention {
-    /// Apply attention residual: `x ← x + MHA(x)`.
+    /// Apply attention residual with full (all-to-all) attention.
     /// `x` is `[time, d_model]` row-major.
     pub fn forward_residual(&self, x: &mut [f32], time: usize) {
+        self.forward_residual_with_mode(x, time, AttentionMode::Full);
+    }
+
+    /// Apply attention residual with the given attention pattern.
+    pub fn forward_residual_with_mode(
+        &self,
+        x: &mut [f32],
+        time: usize,
+        mode: AttentionMode,
+    ) {
         let dm = self.d_model;
         let h = self.n_heads;
         let d = self.head_dim;
@@ -148,9 +176,30 @@ impl MultiHeadAttention {
                     }
                 }
 
-                // 3: scale + softmax.
+                // 3: scale, optional Longformer masking, softmax.
                 for s in score.iter_mut() {
                     *s *= inv_sqrt_d;
+                }
+                if let AttentionMode::LocalGlobal {
+                    local_window,
+                    global_tokens,
+                } = mode
+                {
+                    // Global queries attend to all keys; local queries
+                    // attend only to keys within the window or to a
+                    // global key. Mask the rest with -inf so softmax
+                    // assigns them zero weight.
+                    let q_is_global = t_q < global_tokens;
+                    if !q_is_global {
+                        for t_k in 0..time {
+                            let k_is_global = t_k < global_tokens;
+                            let dist = (t_q as isize - t_k as isize).unsigned_abs();
+                            let in_window = dist <= local_window;
+                            if !(k_is_global || in_window) {
+                                score[t_k] = f32::NEG_INFINITY;
+                            }
+                        }
+                    }
                 }
                 softmax_inplace(&mut score);
 
@@ -290,5 +339,164 @@ mod tests {
             assert!((pe[(3 - 1) * 4 + 2 * j + 1] - pe[(3 + 1) * 4 + 2 * j + 1]).abs() < 1e-6);
             assert!((pe[(3 - 2) * 4 + 2 * j + 1] - pe[(3 + 2) * 4 + 2 * j + 1]).abs() < 1e-6);
         }
+    }
+
+    // --- Longformer (LocalGlobal) tests ---
+
+    /// Build an MHA where V is the identity per-frame (i.e. v_h(t,c) = LN(x)
+    /// at that position, scaled by inv_sqrt). For zero weights the test
+    /// can check the masking shape via output values.
+    fn permissive_mha(d_model: usize, n_heads: usize) -> MultiHeadAttention {
+        let head_dim = d_model / n_heads;
+        // Identity-ish: V projects input to itself (W_v = I, b_v = 0).
+        let mut v_weight = vec![0.0_f32; d_model * d_model];
+        for i in 0..d_model {
+            v_weight[i * d_model + i] = 1.0;
+        }
+        let mut out_weight = vec![0.0_f32; d_model * d_model];
+        for i in 0..d_model {
+            out_weight[i * d_model + i] = 1.0;
+        }
+        MultiHeadAttention {
+            d_model,
+            n_heads,
+            head_dim,
+            ln_gamma: vec![1.0; d_model],
+            ln_beta: vec![0.0; d_model],
+            q_weight: vec![0.0; d_model * d_model],
+            q_bias: vec![0.0; d_model],
+            k_weight: vec![0.0; d_model * d_model],
+            v_weight,
+            v_bias: vec![0.0; d_model],
+            out_weight,
+            out_bias: vec![0.0; d_model],
+            pos_weight: vec![0.0; d_model * d_model],
+            pos_bias_u: vec![0.0; n_heads * head_dim],
+            pos_bias_v: vec![0.0; n_heads * head_dim],
+        }
+    }
+
+    #[test]
+    fn local_global_with_huge_window_equals_full_attention() {
+        // local_window > time means every key is in window for every
+        // query → mask never triggers → output equals Full mode output.
+        let mha = permissive_mha(4, 2);
+        let mut x_full = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut x_lg = x_full.clone();
+
+        mha.forward_residual_with_mode(&mut x_full, 2, AttentionMode::Full);
+        mha.forward_residual_with_mode(
+            &mut x_lg,
+            2,
+            AttentionMode::LocalGlobal {
+                local_window: 100,
+                global_tokens: 0,
+            },
+        );
+
+        for (a, b) in x_full.iter().zip(x_lg.iter()) {
+            assert!((a - b).abs() < 1e-5, "Full vs LG huge-window: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn local_global_with_zero_window_self_attention_only() {
+        // local_window=0, global_tokens=0 means each query t_q only
+        // attends to t_k = t_q (distance 0 ≤ 0). With zero Q/K weights
+        // all (single) score is 0 → softmax = 1.0 → out_h(t_q) = V(t_q).
+        // V is identity, so the residual adds LN(x) to x.
+        let mha = permissive_mha(4, 2);
+        let mut x = vec![1.0_f32, 2.0, 3.0, 4.0]; // 1 frame
+        let original = x.clone();
+        mha.forward_residual_with_mode(
+            &mut x,
+            1,
+            AttentionMode::LocalGlobal {
+                local_window: 0,
+                global_tokens: 0,
+            },
+        );
+        // For a single frame, local_window=0 still means it attends to
+        // itself, so residual is non-trivial. Just verify finite output.
+        for (a, b) in x.iter().zip(original.iter()) {
+            assert!(a.is_finite(), "non-finite output: {a}");
+            assert!(b.is_finite()); // sanity
+        }
+    }
+
+    #[test]
+    fn global_token_attends_to_everything_even_outside_window() {
+        // 5-frame input, local_window=1, global_tokens=1. The global
+        // query (t_q=0) should attend to ALL 5 keys; a local query at
+        // t_q=2 only attends to {0 (global), 1, 2, 3} — NOT 4.
+        //
+        // We use an input that varies *across channels* (so per-frame
+        // LayerNorm produces a non-zero pattern, not a zero scalar) and
+        // place a unique signature at frame 4. Then we run twice with
+        // different masking to show the global query sees the change at
+        // frame 4 while the far-local query does not.
+        let mha = permissive_mha(4, 2);
+
+        // Helper to build the input: zeros, then a signature at frame 4.
+        let make_input = || {
+            let mut x = vec![0.0_f32; 5 * 4];
+            // Frame 4 has [-1, -1, 1, 1] — LN(this) is non-zero.
+            x[4 * 4 + 0] = -1.0;
+            x[4 * 4 + 1] = -1.0;
+            x[4 * 4 + 2] = 1.0;
+            x[4 * 4 + 3] = 1.0;
+            x
+        };
+
+        let mut x_global = make_input();
+        let mut x_far_local = make_input();
+
+        // Both queries use the same window setup, but different t_q.
+        // Run with global_tokens=1 → frame 0 is global.
+        mha.forward_residual_with_mode(
+            &mut x_global,
+            5,
+            AttentionMode::LocalGlobal {
+                local_window: 1,
+                global_tokens: 1,
+            },
+        );
+        // Same mode, but we examine frame 2 (a local query whose window
+        // [1, 3] excludes frame 4).
+        mha.forward_residual_with_mode(
+            &mut x_far_local,
+            5,
+            AttentionMode::LocalGlobal {
+                local_window: 1,
+                global_tokens: 1,
+            },
+        );
+
+        for v in x_global.iter().chain(x_far_local.iter()) {
+            assert!(v.is_finite());
+        }
+
+        // Frame 0 (global query) attended to frame 4 → its output
+        // changed from the zero input.
+        let frame0_change: f32 = (0..4).map(|c| x_global[c].abs()).sum();
+        assert!(
+            frame0_change > 1e-3,
+            "global query (frame 0) should have attended to frame 4 \
+             through the large channel-variation signal; change={frame0_change}",
+        );
+
+        // Frame 2 (local query, window [1, 3], frame 4 OUT of window
+        // and frame 0 is zero). With V=identity and Q/K=0, the only
+        // non-zero contribution to a query's output is from frames
+        // visible to it that have non-zero V. Frames 1, 2, 3 are zero;
+        // frame 0 (global key, in scope) is zero. So frame 2's output
+        // change should be ≪ frame 0's.
+        let frame2_change: f32 = (0..4).map(|c| x_far_local[2 * 4 + c].abs()).sum();
+        assert!(
+            frame2_change < frame0_change,
+            "frame 2 (local query, frame 4 out of window) should change \
+             less than frame 0 (global query). got: frame0={frame0_change}, \
+             frame2={frame2_change}",
+        );
     }
 }

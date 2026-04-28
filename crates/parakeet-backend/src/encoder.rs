@@ -7,8 +7,8 @@
 //! Longformer, vocab=8192.
 
 use fastconformer_core::encoder::{
-    ConformerBlock, ConvModule, FastConformerEncoder, FeedForward, MultiHeadAttention,
-    Subsample, subsampled_mel_dim,
+    AttentionMode, ConformerBlock, ConvModule, FastConformerEncoder, FeedForward,
+    MultiHeadAttention, Subsample, subsampled_mel_dim,
 };
 pub use fastconformer_core::encoder::EncoderOutput;
 use fastconformer_core::Config;
@@ -139,6 +139,8 @@ fn load_block(
     Ok(ConformerBlock {
         ff1,
         attn,
+        // Parakeet only uses full rel-pos attention.
+        attn_mode: AttentionMode::Full,
         conv,
         ff2,
         ln_post_gamma: gguf.dequantize_f32(&format!("{pfx}.ln_post.weight"))?,

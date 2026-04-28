@@ -33,7 +33,7 @@ pub use ops::{
 };
 
 use crate::config::{AttentionType, Config};
-pub use attention::MultiHeadAttention;
+pub use attention::{AttentionMode, MultiHeadAttention};
 pub use block::ConformerBlock;
 pub use conv_module::ConvModule;
 pub use ff::FeedForward;
@@ -61,16 +61,8 @@ impl FastConformerEncoder {
     /// Run the encoder on a `[time, n_mels]` mel spectrogram.
     pub fn forward(&self, mel: &[f32], n_frames: usize) -> Result<EncoderOutput, String> {
         let dm = self.cfg.d_model as usize;
-        if self.cfg.attention_type == AttentionType::RelPosLocalAttn {
-            // TODO: Longformer (local + global) attention. Until that's
-            // wired, callers using ReazonSpeech will get an early error
-            // here rather than silently using vanilla attention.
-            return Err(
-                "FastConformerEncoder: Longformer attention not yet implemented; \
-                 only AttentionType::RelPos is supported in this build"
-                    .into(),
-            );
-        }
+        // Both AttentionType::RelPos and AttentionType::RelPosLocalAttn
+        // are now handled through AttentionMode on each block.
 
         // 1) Subsample.
         let (mut x, t_out) = self.subsample.forward(mel, n_frames);
@@ -123,6 +115,7 @@ mod tests {
                 pos_bias_u: vec![0.0; n_heads * (d_model / n_heads)],
                 pos_bias_v: vec![0.0; n_heads * (d_model / n_heads)],
             },
+            attn_mode: AttentionMode::Full,
             conv: ConvModule {
                 d_model,
                 conv_kernel_size: conv_kernel,
@@ -204,12 +197,17 @@ mod tests {
     }
 
     #[test]
-    fn longformer_attention_returns_clear_error() {
+    fn longformer_encoder_runs_to_completion() {
+        // Same shape as zero_encoder_produces_finite_output_with_correct_shape,
+        // but with reazonspeech config (RelPosLocalAttn). Should now succeed
+        // (Longformer is implemented).
         let mut cfg = Config::dummy_reazonspeech_nemo_v2();
-        cfg.n_layers = 0; // skip any block work
         cfg.feat_in = 8;
         cfg.n_mels = 8;
         cfg.d_model = 8;
+        cfg.n_layers = 1;
+        cfg.n_heads = 2;
+        cfg.conv_kernel_size = 3;
 
         let n_mels_out = subsampled_mel_dim(8);
         let channels = 8;
@@ -228,15 +226,23 @@ mod tests {
             out_weight: vec![0.0; 8 * feat_per_step],
             out_bias: vec![0.0; 8],
         };
+        // Use a Longformer block.
+        let mut blk = zero_block(8, 2, 3);
+        blk.attn_mode = AttentionMode::LocalGlobal {
+            local_window: 4,
+            global_tokens: 1,
+        };
         let enc = FastConformerEncoder {
             cfg,
             subsample,
-            blocks: vec![],
+            blocks: vec![blk],
             ln_post_gamma: vec![1.0; 8],
             ln_post_beta: vec![0.0; 8],
         };
         let mel = vec![0.0_f32; 16 * 8];
-        let err = enc.forward(&mel, 16).unwrap_err();
-        assert!(err.contains("Longformer"), "got: {err}");
+        let out = enc.forward(&mel, 16).unwrap();
+        for v in &out.data {
+            assert!(v.is_finite(), "got non-finite output");
+        }
     }
 }
