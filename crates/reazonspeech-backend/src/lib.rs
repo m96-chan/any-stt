@@ -39,6 +39,8 @@ use any_stt::{Backend, HardwareInfo, SttEngine, SttError, SttResult};
 use fastconformer_core::encoder::FastConformerEncoder;
 use fastconformer_core::{log_mel_spectrogram, SentencePieceTokenizer};
 
+use crate::decoder::RnntDecoder;
+
 pub use fastconformer_core::Config as ReazonSpeechConfig;
 
 /// ReazonSpeech-NeMo-v2 engine.
@@ -46,6 +48,7 @@ pub struct ReazonSpeechEngine {
     model_path: PathBuf,
     config: ReazonSpeechConfig,
     encoder: FastConformerEncoder,
+    decoder: RnntDecoder,
     tokenizer: Option<SentencePieceTokenizer>,
     hardware_info: HardwareInfo,
     backend: Backend,
@@ -74,6 +77,9 @@ impl ReazonSpeechEngine {
         let encoder = encoder::load(&gguf, config.clone())
             .map_err(|e| SttError::TranscriptionFailed(format!("encoder load: {e}")))?;
 
+        let decoder = RnntDecoder::from_gguf(&gguf, config.clone())
+            .map_err(|e| SttError::TranscriptionFailed(format!("decoder load: {e}")))?;
+
         let companion = model_path.with_extension("tokenizer.model");
         let tokenizer = if companion.exists() {
             Some(
@@ -93,6 +99,7 @@ impl ReazonSpeechEngine {
             model_path: model_path.to_path_buf(),
             config,
             encoder,
+            decoder,
             tokenizer,
             hardware_info,
             backend,
@@ -113,25 +120,33 @@ impl SttEngine for ReazonSpeechEngine {
         let start = Instant::now();
 
         let mel = log_mel_spectrogram(audio, &self.config);
-
         let enc_out = self
             .encoder
             .forward(&mel.data, mel.n_frames)
             .map_err(|e| SttError::TranscriptionFailed(format!("encoder forward: {e}")))?;
+        let token_ids = self.decoder.greedy_decode(&enc_out);
 
-        // RNN-T decoder needs a real GGUF loader. When #N8 lands, replace
-        // this with `decoder.greedy_decode(&enc_out)` then
-        // `tokenizer.detokenize(&token_ids)`.
-        let _ = enc_out;
-        Err(SttError::NotImplemented(format!(
-            "ReazonSpeechEngine: encoder forward succeeded ({} frames @ {} d_model, \
-             attention={:?}, {:.0}ms), but RNN-T decoder GGUF loader is not yet \
-             implemented (#N8)",
-            mel.n_frames,
-            self.config.d_model,
-            self.config.attention_type,
-            start.elapsed().as_secs_f64() * 1000.0
-        )))
+        let text = match &self.tokenizer {
+            Some(tok) => tok
+                .detokenize(&token_ids)
+                .map_err(|e| SttError::TranscriptionFailed(format!("detokenize: {e}")))?,
+            None => {
+                // No tokenizer companion was found — surface the raw
+                // token IDs so the caller can still inspect output.
+                token_ids
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        };
+
+        Ok(SttResult {
+            text,
+            language: self.language.clone(),
+            duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+            backend_used: self.backend,
+        })
     }
 
     fn is_ready(&self) -> bool {

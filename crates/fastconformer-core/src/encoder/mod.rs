@@ -32,7 +32,7 @@ pub use ops::{
     softmax_inplace, swish_inplace,
 };
 
-use crate::config::{AttentionType, Config};
+use crate::config::Config;
 pub use attention::{AttentionMode, MultiHeadAttention};
 pub use block::ConformerBlock;
 pub use conv_module::ConvModule;
