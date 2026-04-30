@@ -307,7 +307,11 @@ class FastConformerConfig:
             vocab_size=vocab_size,
             pred_hidden=int(prednet.get("pred_hidden", 640)),
             joint_hidden=int(jointnet.get("joint_hidden", 640)),
-            blank_id=int(dec.get("blank_as_pad", True) and (vocab_size - 1) or 0),
+            # NeMo RNN-T appends blank after the regular vocab, so the
+            # blank id is `vocab_size` and the joint network emits
+            # `vocab_size + 1` logits. The embedding has the same row
+            # count even though blank is never an LSTM input.
+            blank_id=vocab_size,
             tdt_durations=tdt_durations,
             sample_rate=int(preproc.get("sample_rate", 16000)),
             win_length=int(preproc.get("window_size", 0.025) * preproc.get("sample_rate", 16000)),

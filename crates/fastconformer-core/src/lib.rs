@@ -43,5 +43,7 @@ pub mod mel;
 pub mod tokenizer;
 
 pub use config::{AttentionType, Config, ConfigError, DecoderType};
-pub use mel::{log_mel_spectrogram, MelSpectrogram};
+pub use mel::{
+    log_mel_spectrogram, log_mel_spectrogram_no_normalize, mel_filterbank, MelSpectrogram,
+};
 pub use tokenizer::{PieceType, SentencePieceTokenizer};

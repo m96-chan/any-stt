@@ -6,7 +6,8 @@
 
 use fastconformer_core::encoder::{
     AttentionMode, ConformerBlock, ConvModule, FastConformerEncoder, FeedForward,
-    MultiHeadAttention, Subsample, subsampled_mel_dim,
+    MultiHeadAttention, Subsample, SubsampleDwStriding, SubsampleStriding,
+    subsampled_mel_dim,
 };
 pub use fastconformer_core::encoder::EncoderOutput;
 use fastconformer_core::config::AttentionType;
@@ -15,9 +16,9 @@ use gguf_loader::GgufFile;
 
 /// Build a FastConformer encoder from a reazonspeech-nemo-v2 GGUF file.
 ///
-/// Returns a fully-wired encoder if all expected tensors are present.
-/// Tensor naming follows `scripts/convert-nemo-to-gguf.py`'s rename
-/// table.
+/// The subsample stack is auto-detected from the tensor list:
+/// - `enc.subsample.conv.{0,1,2}` only → plain striding (parakeet-style)
+/// - `enc.subsample.conv.{0,2,3,5,6}` → dw_striding (reazonspeech-style)
 pub fn load(gguf: &GgufFile, cfg: Config) -> Result<FastConformerEncoder, String> {
     let dm = cfg.d_model as usize;
     let n_heads = cfg.n_heads as usize;
@@ -25,32 +26,63 @@ pub fn load(gguf: &GgufFile, cfg: Config) -> Result<FastConformerEncoder, String
     let n_mels = cfg.n_mels as usize;
     let n_mels_out = subsampled_mel_dim(n_mels);
 
-    // --- Subsample weights ---
-    let conv0_weight = gguf.dequantize_f32("enc.subsample.conv.0.weight")?;
-    let conv0_bias = gguf.dequantize_f32("enc.subsample.conv.0.bias")?;
-    let conv1_weight = gguf.dequantize_f32("enc.subsample.conv.1.weight")?;
-    let conv1_bias = gguf.dequantize_f32("enc.subsample.conv.1.bias")?;
-    let conv2_weight = gguf.dequantize_f32("enc.subsample.conv.2.weight")?;
-    let conv2_bias = gguf.dequantize_f32("enc.subsample.conv.2.bias")?;
     let out_weight = gguf.dequantize_f32("enc.subsample.out.weight")?;
     let out_bias = gguf.dequantize_f32("enc.subsample.out.bias")?;
 
-    // Channel count is encoded in conv0_bias length.
-    let channels = conv0_bias.len();
-
-    let subsample = Subsample {
-        n_mels,
-        d_model: dm,
-        n_mels_out,
-        channels,
-        conv0_weight,
-        conv0_bias,
-        conv1_weight,
-        conv1_bias,
-        conv2_weight,
-        conv2_bias,
-        out_weight,
-        out_bias,
+    let subsample = if gguf.has_tensor("enc.subsample.conv.3.weight") {
+        // dw_striding: conv.{0, 2, 3, 5, 6}.
+        let conv0_weight = gguf.dequantize_f32("enc.subsample.conv.0.weight")?;
+        let conv0_bias = gguf.dequantize_f32("enc.subsample.conv.0.bias")?;
+        let dw1_weight = gguf.dequantize_f32("enc.subsample.conv.2.weight")?;
+        let dw1_bias = gguf.dequantize_f32("enc.subsample.conv.2.bias")?;
+        let pw1_weight = gguf.dequantize_f32("enc.subsample.conv.3.weight")?;
+        let pw1_bias = gguf.dequantize_f32("enc.subsample.conv.3.bias")?;
+        let dw2_weight = gguf.dequantize_f32("enc.subsample.conv.5.weight")?;
+        let dw2_bias = gguf.dequantize_f32("enc.subsample.conv.5.bias")?;
+        let pw2_weight = gguf.dequantize_f32("enc.subsample.conv.6.weight")?;
+        let pw2_bias = gguf.dequantize_f32("enc.subsample.conv.6.bias")?;
+        let channels = conv0_bias.len();
+        Subsample::DwStriding(SubsampleDwStriding {
+            n_mels,
+            d_model: dm,
+            n_mels_out,
+            channels,
+            conv0_weight,
+            conv0_bias,
+            dw1_weight,
+            dw1_bias,
+            pw1_weight,
+            pw1_bias,
+            dw2_weight,
+            dw2_bias,
+            pw2_weight,
+            pw2_bias,
+            out_weight,
+            out_bias,
+        })
+    } else {
+        // Plain striding: conv.{0, 1, 2}.
+        let conv0_weight = gguf.dequantize_f32("enc.subsample.conv.0.weight")?;
+        let conv0_bias = gguf.dequantize_f32("enc.subsample.conv.0.bias")?;
+        let conv1_weight = gguf.dequantize_f32("enc.subsample.conv.1.weight")?;
+        let conv1_bias = gguf.dequantize_f32("enc.subsample.conv.1.bias")?;
+        let conv2_weight = gguf.dequantize_f32("enc.subsample.conv.2.weight")?;
+        let conv2_bias = gguf.dequantize_f32("enc.subsample.conv.2.bias")?;
+        let channels = conv0_bias.len();
+        Subsample::Striding(SubsampleStriding {
+            n_mels,
+            d_model: dm,
+            n_mels_out,
+            channels,
+            conv0_weight,
+            conv0_bias,
+            conv1_weight,
+            conv1_bias,
+            conv2_weight,
+            conv2_bias,
+            out_weight,
+            out_bias,
+        })
     };
 
     // --- Conformer blocks ---
@@ -67,8 +99,14 @@ pub fn load(gguf: &GgufFile, cfg: Config) -> Result<FastConformerEncoder, String
         blocks.push(block);
     }
 
-    let ln_post_gamma = gguf.dequantize_f32("enc.ln_post.weight")?;
-    let ln_post_beta = gguf.dequantize_f32("enc.ln_post.bias")?;
+    // NeMo Conformer's encoder doesn't have a final post-LN; each block
+    // owns its own. Default to identity (γ=1, β=0) when absent.
+    let ln_post_gamma = gguf
+        .dequantize_f32("enc.ln_post.weight")
+        .unwrap_or_else(|_| vec![1.0; dm]);
+    let ln_post_beta = gguf
+        .dequantize_f32("enc.ln_post.bias")
+        .unwrap_or_else(|_| vec![0.0; dm]);
 
     Ok(FastConformerEncoder {
         cfg,

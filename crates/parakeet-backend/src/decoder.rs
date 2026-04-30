@@ -152,10 +152,93 @@ pub struct TdtDecoder {
 }
 
 impl TdtDecoder {
-    pub fn from_gguf(_gguf: &GgufFile, _cfg: Config) -> Result<Self, String> {
-        Err("TdtDecoder::from_gguf not yet implemented — \
-             needs `dec.rnn.*`, `joint.*`, and `fastconformer.decoder.tdt_durations`"
-            .into())
+    /// Build the decoder from a GGUF model produced by
+    /// `scripts/convert-nemo-to-gguf.py`. Tensor naming follows the same
+    /// convention as the RNN-T family but the joint output is wider:
+    /// `[vocab_with_blank + n_durations]`. The durations array is read
+    /// from the `fastconformer.decoder.tdt_durations` metadata key.
+    pub fn from_gguf(gguf: &GgufFile, cfg: Config) -> Result<Self, String> {
+        let pred_hidden = cfg.pred_hidden as usize;
+        let joint_hidden = cfg.joint_hidden as usize;
+        let d_model = cfg.d_model as usize;
+
+        // tdt_durations metadata array (uint32 typically; accept ints too).
+        let durations: Vec<u32> = match gguf.meta("fastconformer.decoder.tdt_durations") {
+            Some(gguf_loader::MetaValue::ArrayUint32(v)) => v.clone(),
+            Some(gguf_loader::MetaValue::ArrayInt32(v)) => {
+                v.iter().map(|&x| x as u32).collect()
+            }
+            Some(gguf_loader::MetaValue::ArrayInt64(v)) => {
+                v.iter().map(|&x| x as u32).collect()
+            }
+            Some(other) => {
+                return Err(format!(
+                    "fastconformer.decoder.tdt_durations: \
+                     unexpected metadata variant {other:?}"
+                ));
+            }
+            None => {
+                // Fall back to NeMo's default [0, 1, 2, 3, 4].
+                vec![0, 1, 2, 3, 4]
+            }
+        };
+        let n_durations = durations.len();
+
+        let embedding = gguf.dequantize_f32("dec.embed.weight")?;
+        if embedding.len() % pred_hidden != 0 {
+            return Err(format!(
+                "dec.embed.weight size {} not a multiple of pred_hidden={}",
+                embedding.len(),
+                pred_hidden
+            ));
+        }
+        let vocab_with_blank = embedding.len() / pred_hidden;
+
+        let mut layers = Vec::new();
+        for l in 0_usize.. {
+            let key = format!("dec.rnn.{l}.weight_ih");
+            if !gguf.has_tensor(&key) {
+                break;
+            }
+            let w_ih = gguf.dequantize_f32(&format!("dec.rnn.{l}.weight_ih"))?;
+            let w_hh = gguf.dequantize_f32(&format!("dec.rnn.{l}.weight_hh"))?;
+            let b_ih = gguf.dequantize_f32(&format!("dec.rnn.{l}.bias_ih"))?;
+            let b_hh = gguf.dequantize_f32(&format!("dec.rnn.{l}.bias_hh"))?;
+            layers.push(LstmLayerWeights {
+                input_size: pred_hidden,
+                hidden_size: pred_hidden,
+                w_ih,
+                w_hh,
+                b_ih,
+                b_hh,
+            });
+        }
+        if layers.is_empty() {
+            return Err("no `dec.rnn.0.*` tensors found".into());
+        }
+
+        let pred = PredictionNetwork::from_test_weights(
+            embedding,
+            pred_hidden,
+            vocab_with_blank,
+            layers,
+        );
+
+        let joint = JointNetwork::from_test_weights(
+            d_model,
+            pred_hidden,
+            joint_hidden,
+            vocab_with_blank,
+            n_durations,
+            gguf.dequantize_f32("joint.enc.weight")?,
+            gguf.dequantize_f32("joint.enc.bias")?,
+            gguf.dequantize_f32("joint.pred.weight")?,
+            gguf.dequantize_f32("joint.pred.bias")?,
+            gguf.dequantize_f32("joint.fc2.weight")?,
+            gguf.dequantize_f32("joint.fc2.bias")?,
+        );
+
+        Self::from_weights(cfg, pred, joint, durations)
     }
 
     /// Build from in-memory weights (used by tests).
@@ -171,9 +254,9 @@ impl TdtDecoder {
                 pred.pred_hidden, joint.pred_hidden
             ));
         }
-        if pred.vocab_size + 1 != joint.vocab_size_with_blank {
+        if pred.vocab_size != joint.vocab_size_with_blank {
             return Err(format!(
-                "vocab mismatch: pred={} joint={}",
+                "vocab mismatch: pred.vocab_size={} joint.vocab_with_blank={}",
                 pred.vocab_size, joint.vocab_size_with_blank
             ));
         }
@@ -369,9 +452,9 @@ mod tests {
         let blank = vocab_size as u32;
         let vsb = vocab_size + 1;
 
-        // Embedding rows for tokens 0..vocab_size.
-        let mut emb = vec![0.0_f32; vocab_size * pred_h];
-        for tok in 0..vocab_size {
+        // Embedding rows for tokens 0..vsb (NeMo includes blank slot).
+        let mut emb = vec![0.0_f32; vsb * pred_h];
+        for tok in 0..vsb {
             for k in 0..pred_h {
                 emb[tok * pred_h + k] = (tok as f32) * 0.1 + (k as f32) * 0.01;
             }
@@ -384,7 +467,7 @@ mod tests {
             b_ih: vec![0.0; 4 * pred_h],
             b_hh: vec![0.0; 4 * pred_h],
         }];
-        let pred = PredictionNetwork::from_test_weights(emb, pred_h, vocab_size, layers);
+        let pred = PredictionNetwork::from_test_weights(emb, pred_h, vsb, layers);
 
         let total_out = vsb + n_dur;
         let w_enc = vec![0.0; joint_h * enc_dim];
@@ -482,10 +565,11 @@ mod tests {
     #[test]
     fn from_weights_rejects_duration_count_mismatch() {
         let cfg = Config::dummy_parakeet_tdt_v3();
+        // Embedding rows = vocab_with_blank = 5 to match joint output.
         let pred = PredictionNetwork::from_test_weights(
-            vec![0.0; 4 * 3],
+            vec![0.0; 5 * 3],
             3,
-            4,
+            5, // vocab_with_blank
             vec![LstmLayerWeights {
                 input_size: 3,
                 hidden_size: 3,
@@ -499,7 +583,7 @@ mod tests {
             4,
             3,
             5,
-            5,
+            5, // vocab_with_blank
             5, // expects 5 durations
             vec![0.0; 5 * 4],
             vec![0.0; 5],
@@ -508,7 +592,7 @@ mod tests {
             vec![0.0; (5 + 5) * 5],
             vec![0.0; 5 + 5],
         );
-        // Pass only 3 durations — should error.
+        // Pass only 3 durations — should error on duration count.
         assert!(TdtDecoder::from_weights(cfg, pred, joint, vec![0, 1, 2]).is_err());
     }
 }

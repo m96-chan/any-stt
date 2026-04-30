@@ -49,6 +49,22 @@ const LOG_ZERO_GUARD: f32 = 1e-5;
 /// Audio is assumed to be 16 kHz mono f32 in [-1, 1]. Out-of-range values
 /// are not clamped — that is the caller's responsibility.
 pub fn log_mel_spectrogram(audio: &[f32], cfg: &Config) -> MelSpectrogram {
+    log_mel_spectrogram_internal(audio, cfg, /*normalize*/ true)
+}
+
+/// Diagnostic variant that skips per-feature normalization. Output is
+/// the raw `log(mel + 1e-5)` ready to compare against
+/// `torch.log(mel + 1e-5)` references.
+#[doc(hidden)]
+pub fn log_mel_spectrogram_no_normalize(audio: &[f32], cfg: &Config) -> MelSpectrogram {
+    log_mel_spectrogram_internal(audio, cfg, /*normalize*/ false)
+}
+
+fn log_mel_spectrogram_internal(
+    audio: &[f32],
+    cfg: &Config,
+    normalize: bool,
+) -> MelSpectrogram {
     assert_eq!(
         cfg.sample_rate, 16000,
         "only 16 kHz sample rate is wired; got {}",
@@ -77,11 +93,33 @@ pub fn log_mel_spectrogram(audio: &[f32], cfg: &Config) -> MelSpectrogram {
         emph.push(audio[i] - PREEMPH * audio[i - 1]);
     }
 
-    // 2. Hann window of length win_length, padded into n_fft-sized buffer.
+    // 2. Center-pad with reflection by n_fft / 2 on each side. This
+    //    matches torch.stft(center=True, pad_mode="reflect"), which is
+    //    NeMo's default. Without it we lose the first and last 2-3
+    //    frames vs the Python reference.
+    let pad = n_fft / 2;
+    let mut padded: Vec<f32> = Vec::with_capacity(emph.len() + 2 * pad);
+    for i in (1..=pad).rev() {
+        padded.push(emph[i.min(emph.len() - 1)]);
+    }
+    padded.extend_from_slice(&emph);
+    let n = emph.len();
+    for i in 1..=pad {
+        let idx = n.saturating_sub(1 + i);
+        padded.push(emph[idx]);
+    }
+    let emph = padded;
+
+    // 3. Hann window of length win_length, padded into n_fft-sized buffer.
     let hann = hann_window(win_length);
 
-    // 3. Frame the signal and run rFFT.
-    let n_frames = (emph.len() - win_length) / hop_length + 1;
+    // 4. Frame the signal and run rFFT. With center=True semantics the
+    //    frame count formula matches torch.stft: floor(N / hop) + 1.
+    let n_frames = if emph.len() < n_fft {
+        1
+    } else {
+        (emph.len() - n_fft) / hop_length + 1
+    };
     let mut planner = RealFftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(n_fft);
     let mut fft_in = vec![0.0_f32; n_fft];
@@ -91,15 +129,21 @@ pub fn log_mel_spectrogram(audio: &[f32], cfg: &Config) -> MelSpectrogram {
 
     let mut log_mel = vec![0.0_f32; n_frames * n_mels];
 
+    // torch.stft pads the window with zeros CENTERED in the n_fft
+    // buffer: leading zeros, then the win_length-long hann, then
+    // trailing zeros. Frame samples occupy the full n_fft window;
+    // multiplication by the centered window zeros out the edges.
+    let win_off = (n_fft - win_length) / 2;
     for t in 0..n_frames {
         let start = t * hop_length;
-        let frame = &emph[start..start + win_length];
-        // Window into n_fft-sized buffer (rest is zero-padded).
-        for i in 0..win_length {
-            fft_in[i] = frame[i] * hann[i];
-        }
-        for v in &mut fft_in[win_length..] {
+        for v in fft_in.iter_mut() {
             *v = 0.0;
+        }
+        for i in 0..win_length {
+            let src = start + win_off + i;
+            if src < emph.len() {
+                fft_in[win_off + i] = emph[src] * hann[i];
+            }
         }
 
         fft.process(&mut fft_in, &mut fft_out)
@@ -127,8 +171,12 @@ pub fn log_mel_spectrogram(audio: &[f32], cfg: &Config) -> MelSpectrogram {
         }
     }
 
-    // 4. Per-feature normalization across time.
-    normalize_per_feature(&mut log_mel, n_frames, n_mels);
+    // 4. Per-feature normalization across time (matches NeMo's
+    //    `normalize=per_feature` default; can be skipped via the
+    //    `_no_normalize` variant for layer-by-layer comparison).
+    if normalize {
+        normalize_per_feature(&mut log_mel, n_frames, n_mels);
+    }
 
     MelSpectrogram {
         data: log_mel,
@@ -137,13 +185,17 @@ pub fn log_mel_spectrogram(audio: &[f32], cfg: &Config) -> MelSpectrogram {
     }
 }
 
-/// Hann window of given length, NeMo-compatible (periodic=False, i.e. the
-/// torch.hann_window default for spectrogram input).
+/// Hann window of given length, NeMo-compatible (`periodic=True` —
+/// torch.stft / torch.hann_window default for spectrogram use). Formula:
+///     w[i] = 0.5 * (1 - cos(2π · i / n))   for i in 0..n
 fn hann_window(n: usize) -> Vec<f32> {
-    if n <= 1 {
-        return vec![1.0; n];
+    if n == 0 {
+        return Vec::new();
     }
-    let denom = (n - 1) as f32;
+    if n == 1 {
+        return vec![1.0];
+    }
+    let denom = n as f32;
     (0..n)
         .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / denom).cos()))
         .collect()
@@ -151,9 +203,12 @@ fn hann_window(n: usize) -> Vec<f32> {
 
 /// Mel-filterbank matrix, slaney scale (matches librosa default + NeMo).
 ///
-/// Returns `n_mels` filters, each of length `n_fft / 2 + 1`. Sums to 1.0
-/// across active bins by triangle area normalization (slaney-style).
-fn mel_filterbank(n_mels: usize, n_fft: usize, sample_rate: f32) -> Vec<Vec<f32>> {
+/// Returns `n_mels` filters, each of length `n_fft / 2 + 1`. Each filter
+/// is a triangle in mel space, area-normalized via Slaney convention
+/// (`enorm = 2 / (high_hz - low_hz)`). The resulting matrix matches
+/// `torchaudio.functional.melscale_fbanks(norm="slaney", mel_scale="slaney")`
+/// up to float epsilon.
+pub fn mel_filterbank(n_mels: usize, n_fft: usize, sample_rate: f32) -> Vec<Vec<f32>> {
     let n_bins = n_fft / 2 + 1;
     let f_min = 0.0_f32;
     let f_max = sample_rate / 2.0;
@@ -268,12 +323,15 @@ mod tests {
     #[test]
     fn frame_count_matches_formula() {
         let cfg = Config::dummy_reazonspeech_nemo_v2();
-        // 1s @ 16kHz, win=400, hop=160 → (16000-400)/160 + 1 = 98 frames.
+        // 1s @ 16kHz, n_fft=512, hop=160. With NeMo's center=True
+        // (reflect-pad by n_fft/2=256 each side):
+        //   padded len = 16000 + 512 = 16512
+        //   frames = (16512 - 512) / 160 + 1 = 101
         let audio = vec![0.0_f32; 16000];
         let mel = log_mel_spectrogram(&audio, &cfg);
-        assert_eq!(mel.n_frames, 98);
+        assert_eq!(mel.n_frames, 101);
         assert_eq!(mel.n_mels, 80);
-        assert_eq!(mel.data.len(), 98 * 80);
+        assert_eq!(mel.data.len(), 101 * 80);
     }
 
     #[test]

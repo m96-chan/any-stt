@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Cross-check `fastconformer_core::log_mel_spectrogram` against the
+NeMo `AudioToMelSpectrogramPreprocessor` reference implementation.
+
+Independent of nemo-toolkit (which is heavy and python-3.14-incompatible
+as of 2026-04). Reimplements the NeMo preprocessor with stock
+torchaudio + numpy primitives matching NeMo's defaults
+(sample_rate=16000, window_size=0.025, window_stride=0.010,
+features=80, n_fft=512, preemph=0.97, log_zero_guard=1e-5,
+normalize=per_feature, mag_power=2.0).
+
+Usage:
+    python scripts/validate-mel.py \\
+        --audio third-party/whisper.cpp/samples/japanese_test.wav \\
+        --out /tmp/mel_ref.npy
+
+Then compare in Rust:
+    cargo test -p fastconformer-core --test layer_reference \\
+        mel_matches_nemo_reference -- --ignored
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--audio", type=Path, required=True)
+    ap.add_argument("--out", type=Path, required=True,
+                    help="output .npy path (shape [n_frames, n_mels])")
+    ap.add_argument("--n-mels", type=int, default=80)
+    ap.add_argument("--sr", type=int, default=16000)
+    ap.add_argument("--win", type=int, default=400)
+    ap.add_argument("--hop", type=int, default=160)
+    ap.add_argument("--n-fft", type=int, default=512)
+    ap.add_argument("--preemph", type=float, default=0.97)
+    ap.add_argument("--log-eps", type=float, default=1e-5)
+    ap.add_argument("--dump-intermediates", action="store_true",
+                    help="dump preemph/hann/mel_fb/log_mel_pre_normalize")
+    args = ap.parse_args()
+
+    try:
+        import numpy as np
+        import torch
+        import torchaudio
+    except ImportError as e:
+        sys.exit(f"missing dep: {e.name} — pip install torch torchaudio numpy")
+
+    if not args.audio.exists():
+        sys.exit(f"not found: {args.audio}")
+
+    # Load audio (WAV) via soundfile to avoid torchaudio's heavy backend.
+    import soundfile as sf
+    audio, sr = sf.read(str(args.audio), dtype="float32", always_2d=False)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    waveform = torch.from_numpy(audio.copy())
+    if sr != args.sr:
+        waveform = torchaudio.functional.resample(waveform, sr, args.sr)
+    print(f"loaded {waveform.numel()} samples = {waveform.numel()/args.sr:.2f}s")
+
+    # ---- NeMo-style preprocessing ----
+
+    # 1. Pre-emphasis (matches NeMo when preemph != 0).
+    pre = torch.cat([waveform[:1], waveform[1:] - args.preemph * waveform[:-1]])
+
+    # 2. STFT. NeMo uses torch.stft with a Hann window of `win` samples,
+    #    n_fft chosen as next pow2 of win (here 400 → 512), hop `hop`,
+    #    center=True (default), pad_mode='reflect' (NeMo default).
+    window = torch.hann_window(args.win, periodic=True)  # NeMo uses periodic
+    spec = torch.stft(
+        pre,
+        n_fft=args.n_fft,
+        hop_length=args.hop,
+        win_length=args.win,
+        window=window,
+        center=True,
+        pad_mode="reflect",
+        normalized=False,
+        onesided=True,
+        return_complex=True,
+    )  # [n_freq=257, n_frames]
+
+    # 3. Power spectrum |X|².
+    power = spec.abs() ** 2  # [n_freq, n_frames]
+
+    # 4. Mel filterbank. NeMo uses slaney scale, slaney area normalization.
+    mel_fb = torchaudio.functional.melscale_fbanks(
+        n_freqs=args.n_fft // 2 + 1,
+        f_min=0.0,
+        f_max=args.sr / 2,
+        n_mels=args.n_mels,
+        sample_rate=args.sr,
+        norm="slaney",
+        mel_scale="slaney",
+    )  # [n_freq, n_mels]
+
+    mel = mel_fb.T @ power  # [n_mels, n_frames]
+
+    # 5. Log compression with NeMo's zero guard.
+    log_mel = torch.log(mel + args.log_eps)
+
+    # 6. Per-feature normalization across time (NeMo `normalize=per_feature`).
+    mean = log_mel.mean(dim=1, keepdim=True)
+    std = log_mel.std(dim=1, keepdim=True, unbiased=False) + args.log_eps
+    log_mel = (log_mel - mean) / std
+
+    # Transpose to [n_frames, n_mels] for the Rust convention.
+    # `.contiguous()` so numpy stores in C-order (the npy reader on the
+    # Rust side rejects fortran_order=True).
+    out = log_mel.T.contiguous().numpy().astype(np.float32, copy=False)
+    out = np.ascontiguousarray(out)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    np.save(args.out, out)
+    print(f"wrote {args.out} shape={out.shape} dtype={out.dtype}")
+
+    # Quick sanity print.
+    print(f"  range: [{out.min():.4f}, {out.max():.4f}]")
+    print(f"  per-feature mean (first 5): {out.mean(axis=0)[:5]}")
+    print(f"  per-feature std  (first 5): {out.std(axis=0)[:5]}")
+
+    # Optional intermediate dumps to help triangulate where Rust drifts.
+    if args.dump_intermediates:
+        debug_dir = args.out.parent / "debug"
+        debug_dir.mkdir(exist_ok=True)
+        np.save(debug_dir / "preemph.npy", pre.numpy().astype(np.float32))
+        np.save(debug_dir / "mel_filterbank.npy", mel_fb.numpy().astype(np.float32))
+        np.save(debug_dir / "log_mel_pre_normalize.npy",
+                np.ascontiguousarray(torch.log(mel + args.log_eps).T.contiguous()
+                                     .numpy().astype(np.float32)))
+        np.save(debug_dir / "hann.npy", window.numpy().astype(np.float32))
+        np.save(debug_dir / "power_frame0.npy",
+                np.ascontiguousarray(power[:, 0].numpy().astype(np.float32)))
+        np.save(debug_dir / "power_frame100.npy",
+                np.ascontiguousarray(power[:, 100].numpy().astype(np.float32)))
+        np.save(debug_dir / "log_mel_frame100.npy",
+                np.ascontiguousarray(torch.log(mel + args.log_eps)[:, 100]
+                                     .numpy().astype(np.float32)))
+        # Frame 100's FFT input (windowed audio of length n_fft).
+        # Reproduce torch.stft's framing for verification: reflect-pad
+        # the preemph'd signal by n_fft/2 each side, then take the
+        # 100th frame at start = 100 * hop_length.
+        pad = args.n_fft // 2
+        padded = torch.nn.functional.pad(pre.unsqueeze(0), (pad, pad), mode="reflect").squeeze(0)
+        start = 100 * args.hop
+        frame = padded[start:start + args.n_fft].clone()
+        # Window: torch.stft pads window with trailing zeros to n_fft.
+        win_padded = torch.zeros(args.n_fft, dtype=torch.float32)
+        win_padded[:args.win] = window
+        windowed = frame * win_padded
+        np.save(debug_dir / "frame100_windowed.npy",
+                np.ascontiguousarray(windowed.numpy().astype(np.float32)))
+        # Frame 100's complex FFT output (re/im interleaved).
+        f100_fft = torch.fft.rfft(windowed, n=args.n_fft)
+        f100_fft_ri = torch.stack([f100_fft.real, f100_fft.imag], dim=1).flatten()
+        np.save(debug_dir / "frame100_fft_re_im.npy",
+                np.ascontiguousarray(f100_fft_ri.numpy().astype(np.float32)))
+        print(f"  wrote intermediate fixtures to {debug_dir}/")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
