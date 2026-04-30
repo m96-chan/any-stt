@@ -234,22 +234,144 @@ fn mel_filterbank_matches_torchaudio_reference_when_present() {
     );
 }
 
+/// Same as power_frame0 but for frame 100 (audio active region).
 #[test]
-fn log_mel_pre_normalize_matches_torchaudio_when_present() {
-    // Compares log(mel + ε) BEFORE per-feature normalization. Helps
-    // separate normalization-formula bugs from pre-normalization
-    // numerical drift.
+fn power_frame100_matches_torch_when_present() {
+    let path = fixtures_root().join("debug").join("power_frame100.npy");
+    if !path.exists() {
+        eprintln!("SKIPPED: no power_frame100 fixture");
+        return;
+    }
+    let ref_data = NpyArray::load(&path).expect("power_frame100");
+    assert_eq!(ref_data.shape, vec![257]);
+
+    let audio_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third-party/whisper.cpp/samples/japanese_test.wav");
+    let audio = read_wav_16k_mono(&audio_path).expect("wav");
+    let preemph: f32 = 0.97;
+    let mut emph = vec![0.0_f32; audio.len()];
+    emph[0] = audio[0];
+    for i in 1..audio.len() {
+        emph[i] = audio[i] - preemph * audio[i - 1];
+    }
+    let n_fft = 512;
+    let win_length = 400;
+    let hop_length = 160;
+    let pad = n_fft / 2;
+    let mut padded: Vec<f32> = Vec::with_capacity(emph.len() + 2 * pad);
+    for i in (1..=pad).rev() {
+        padded.push(emph[i.min(emph.len() - 1)]);
+    }
+    padded.extend_from_slice(&emph);
+    let n = emph.len();
+    for i in 1..=pad {
+        let idx = n.saturating_sub(1 + i);
+        padded.push(emph[idx]);
+    }
+
+    // torch.stft centers the win_length-long hann inside the n_fft
+    // buffer (zeros at [0..win_off], hann at [win_off..win_off+win],
+    // zeros at the tail). win_off = (n_fft - win_length) / 2 = 56.
+    let mut windowed = vec![0.0_f32; n_fft];
+    let two_pi = 2.0 * std::f32::consts::PI;
+    let start = 100 * hop_length;
+    let win_off = (n_fft - win_length) / 2;
+    for i in 0..win_length {
+        let h = 0.5 * (1.0 - (two_pi * i as f32 / win_length as f32).cos());
+        windowed[win_off + i] = padded[start + win_off + i] * h;
+    }
+
+    use realfft::num_complex::Complex;
+    use realfft::RealFftPlanner;
+    let mut planner = RealFftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(n_fft);
+    let mut input = windowed.clone();
+    let mut output = vec![Complex::new(0.0_f32, 0.0); n_fft / 2 + 1];
+    fft.process(&mut input, &mut output).unwrap();
+    let power: Vec<f32> = output.iter().map(|c| c.re * c.re + c.im * c.im).collect();
+
+    let (max_abs, max_rel) = max_diff(&power, &ref_data.data);
+    eprintln!("power_frame100 max_abs={max_abs:.6e}, max_rel={max_rel:.6}");
+    eprintln!("  ours[0..5]: {:?}", &power[..5]);
+    eprintln!("  ref [0..5]: {:?}", &ref_data.data[..5]);
+    assert!(max_abs < 1e-3, "power_frame100 diverges: max_abs={max_abs}");
+}
+
+/// Compare power spectrum at frame 0 against torch reference.
+/// If this matches, the issue downstream is in mel projection or log.
+#[test]
+fn power_frame0_matches_torch_when_present() {
+    let path = fixtures_root().join("debug").join("power_frame0.npy");
+    if !path.exists() {
+        eprintln!("SKIPPED: no power_frame0 fixture");
+        return;
+    }
+    let ref_data = NpyArray::load(&path).expect("power_frame0");
+    assert_eq!(ref_data.shape, vec![257]);
+
+    let audio_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third-party/whisper.cpp/samples/japanese_test.wav");
+    let audio = read_wav_16k_mono(&audio_path).expect("wav");
+
+    // Reproduce frame 0 internally.
+    let preemph: f32 = 0.97;
+    let mut emph = vec![0.0_f32; audio.len()];
+    emph[0] = audio[0];
+    for i in 1..audio.len() {
+        emph[i] = audio[i] - preemph * audio[i - 1];
+    }
+    let n_fft = 512;
+    let win_length = 400;
+    let pad = n_fft / 2;
+    let mut padded: Vec<f32> = Vec::with_capacity(emph.len() + 2 * pad);
+    for i in (1..=pad).rev() {
+        padded.push(emph[i.min(emph.len() - 1)]);
+    }
+    padded.extend_from_slice(&emph);
+    let n = emph.len();
+    for i in 1..=pad {
+        let idx = n.saturating_sub(1 + i);
+        padded.push(emph[idx]);
+    }
+
+    // Apply hann (periodic, n=400), CENTERED in the n_fft=512 buffer
+    // (matches torch.stft's internal window padding).
+    let mut windowed = vec![0.0_f32; n_fft];
+    let two_pi = 2.0 * std::f32::consts::PI;
+    let win_off = (n_fft - win_length) / 2;
+    for i in 0..win_length {
+        let h = 0.5 * (1.0 - (two_pi * i as f32 / win_length as f32).cos());
+        windowed[win_off + i] = padded[win_off + i] * h;
+    }
+
+    // Run rFFT via realfft.
+    use realfft::num_complex::Complex;
+    use realfft::RealFftPlanner;
+    let mut planner = RealFftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(n_fft);
+    let mut input = windowed.clone();
+    let mut output = vec![Complex::new(0.0_f32, 0.0); n_fft / 2 + 1];
+    fft.process(&mut input, &mut output).unwrap();
+    let power: Vec<f32> = output.iter().map(|c| c.re * c.re + c.im * c.im).collect();
+
+    let (max_abs, max_rel) = max_diff(&power, &ref_data.data);
+    eprintln!("power_frame0 max_abs={max_abs:.6e}, max_rel={max_rel:.6}");
+    eprintln!("  ours[0..5]: {:?}", &power[..5]);
+    eprintln!("  ref [0..5]: {:?}", &ref_data.data[..5]);
+}
+
+/// Verify that the frame extraction inside `log_mel_spectrogram` matches
+/// the manual reconstruction in `frame100_windowed_matches_torch_when_present`.
+/// If this passes the issue is somewhere downstream of frame extraction.
+#[test]
+fn log_mel_internal_matches_manual_frame100_when_present() {
     let path = fixtures_root().join("debug").join("log_mel_pre_normalize.npy");
     if !path.exists() {
         eprintln!("SKIPPED: no log_mel_pre_normalize fixture");
         return;
     }
-    let ref_data = NpyArray::load(&path).expect("load log_mel_pre_normalize.npy");
-    eprintln!("ref shape: {:?}", ref_data.shape);
-    // Reference shape is [n_frames, n_mels].
-    assert_eq!(ref_data.shape.len(), 2);
+    let ref_data = NpyArray::load(&path).expect("log_mel_pre_normalize");
 
-    // Re-run our log-mel on the same audio.
     let audio_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../third-party/whisper.cpp/samples/japanese_test.wav");
     if !audio_path.exists() {
@@ -259,24 +381,157 @@ fn log_mel_pre_normalize_matches_torchaudio_when_present() {
     let audio = read_wav_16k_mono(&audio_path).expect("wav");
     use fastconformer_core::Config;
     let cfg = Config::dummy_reazonspeech_nemo_v2();
+    let mel = fastconformer_core::log_mel_spectrogram_no_normalize(&audio, &cfg);
 
-    // log_mel_spectrogram applies normalization; we want the PRE-normalize
-    // values. There's no public API for that yet — just compare a few
-    // statistics for now.
-    let mel = fastconformer_core::log_mel_spectrogram(&audio, &cfg);
-    let n_frames = mel.n_frames;
-    let n_mels = mel.n_mels;
-    let ref_mean = ref_data.data.iter().sum::<f32>() / ref_data.data.len() as f32;
-    let our_mean = mel.data.iter().sum::<f32>() / mel.data.len() as f32;
-    eprintln!(
-        "  ref:  shape={:?} mean={:.4}",
-        ref_data.shape, ref_mean
+    // Compare frame 100 specifically.
+    let n_mels = 80;
+    let row100_ours = &mel.data[100 * n_mels..101 * n_mels];
+    let row100_ref = &ref_data.data[100 * n_mels..101 * n_mels];
+    let (max_abs, max_rel) = max_diff(row100_ours, row100_ref);
+    eprintln!("frame 100 row max_abs={max_abs:.6e}, max_rel={max_rel:.6}");
+    eprintln!("  ours[0..5]: {:?}", &row100_ours[..5]);
+    eprintln!("  ref [0..5]: {:?}", &row100_ref[..5]);
+}
+
+#[test]
+fn frame100_windowed_matches_torch_when_present() {
+    // Frame 100's windowed FFT input (length n_fft=512). If this matches
+    // torch.stft's frame 100, the divergence is in the FFT itself or
+    // downstream. If it diverges here, the issue is in our reflect
+    // padding or window-zero alignment.
+    let path = fixtures_root().join("debug").join("frame100_windowed.npy");
+    if !path.exists() {
+        eprintln!("SKIPPED: no frame100_windowed fixture");
+        return;
+    }
+    let ref_data = NpyArray::load(&path).expect("frame100_windowed");
+    assert_eq!(ref_data.shape, vec![512], "expected n_fft=512");
+
+    let audio_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third-party/whisper.cpp/samples/japanese_test.wav");
+    if !audio_path.exists() {
+        eprintln!("SKIPPED: japanese_test.wav not found");
+        return;
+    }
+    let audio = read_wav_16k_mono(&audio_path).expect("wav");
+
+    // Reproduce my Rust frame extraction for frame 100.
+    let preemph: f32 = 0.97;
+    let mut emph = vec![0.0_f32; audio.len()];
+    emph[0] = audio[0];
+    for i in 1..audio.len() {
+        emph[i] = audio[i] - preemph * audio[i - 1];
+    }
+    let n_fft = 512;
+    let win_length = 400;
+    let hop_length = 160;
+    let pad = n_fft / 2;
+    let mut padded: Vec<f32> = Vec::with_capacity(emph.len() + 2 * pad);
+    for i in (1..=pad).rev() {
+        padded.push(emph[i.min(emph.len() - 1)]);
+    }
+    padded.extend_from_slice(&emph);
+    let n = emph.len();
+    for i in 1..=pad {
+        let idx = n.saturating_sub(1 + i);
+        padded.push(emph[idx]);
+    }
+    // Apply hann window (periodic) of len 400, padded with trailing
+    // zeros to n_fft=512 — same as torch.stft.
+    let mut hann = vec![0.0_f32; n_fft];
+    let two_pi = 2.0 * std::f32::consts::PI;
+    for i in 0..win_length {
+        hann[i] = 0.5 * (1.0 - (two_pi * i as f32 / win_length as f32).cos());
+    }
+    let start = 100 * hop_length;
+    let mut windowed = vec![0.0_f32; n_fft];
+    for i in 0..n_fft {
+        if start + i < padded.len() {
+            windowed[i] = padded[start + i] * hann[i];
+        }
+    }
+
+    let (max_abs, max_rel) = max_diff(&windowed, &ref_data.data);
+    eprintln!("frame100_windowed max_abs={max_abs:.6e}, max_rel={max_rel:.6}");
+    assert!(
+        max_abs < 1e-5,
+        "frame100 windowed input diverges: max_abs={max_abs}"
     );
-    eprintln!(
-        "  ours: shape=[{}, {}] mean={:.4}",
-        n_frames, n_mels, our_mean
+}
+
+#[test]
+fn preemph_matches_torchaudio_when_present() {
+    let path = fixtures_root().join("debug").join("preemph.npy");
+    if !path.exists() {
+        eprintln!("SKIPPED: no preemph fixture");
+        return;
+    }
+    let ref_data = NpyArray::load(&path).expect("preemph.npy");
+    eprintln!("preemph ref shape: {:?}", ref_data.shape);
+
+    // Re-run our pre-emphasis on the same audio.
+    let audio_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third-party/whisper.cpp/samples/japanese_test.wav");
+    if !audio_path.exists() {
+        eprintln!("SKIPPED: japanese_test.wav not found");
+        return;
+    }
+    let audio = read_wav_16k_mono(&audio_path).expect("wav");
+
+    // NeMo formula: y[0] = x[0]; y[i] = x[i] - 0.97 * x[i-1].
+    let preemph: f32 = 0.97;
+    let mut ours = vec![0.0_f32; audio.len()];
+    ours[0] = audio[0];
+    for i in 1..audio.len() {
+        ours[i] = audio[i] - preemph * audio[i - 1];
+    }
+
+    assert_eq!(ours.len(), ref_data.data.len(), "length mismatch");
+    let (max_abs, max_rel) = max_diff(&ours, &ref_data.data);
+    eprintln!("preemph max_abs={max_abs:.6e}, max_rel={max_rel:.6}");
+    assert!(
+        max_abs < 1e-6,
+        "preemph diverges from torch: max_abs={max_abs}"
     );
-    // No assertion here — informational only.
+}
+
+#[test]
+fn log_mel_pre_normalize_matches_torchaudio_when_present() {
+    // Compares log(mel + ε) BEFORE per-feature normalization.
+    let path = fixtures_root().join("debug").join("log_mel_pre_normalize.npy");
+    if !path.exists() {
+        eprintln!("SKIPPED: no log_mel_pre_normalize fixture");
+        return;
+    }
+    let ref_data = NpyArray::load(&path).expect("load log_mel_pre_normalize.npy");
+    assert_eq!(ref_data.shape.len(), 2, "expected 2-D ref");
+
+    let audio_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third-party/whisper.cpp/samples/japanese_test.wav");
+    if !audio_path.exists() {
+        eprintln!("SKIPPED: japanese_test.wav not found");
+        return;
+    }
+    let audio = read_wav_16k_mono(&audio_path).expect("wav");
+    use fastconformer_core::Config;
+    let cfg = Config::dummy_reazonspeech_nemo_v2();
+    let mel = fastconformer_core::log_mel_spectrogram_no_normalize(&audio, &cfg);
+    assert_eq!(mel.n_frames, ref_data.shape[0], "frame count");
+    assert_eq!(mel.n_mels, ref_data.shape[1], "n_mels");
+
+    let (max_abs, max_rel) = max_diff(&mel.data, &ref_data.data);
+    eprintln!("log_mel_pre_normalize max_abs={max_abs:.6}, max_rel={max_rel:.6}");
+    eprintln!("  ours range: [{:.4}, {:.4}]",
+              mel.data.iter().cloned().fold(f32::INFINITY, f32::min),
+              mel.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    eprintln!("  ref  range: [{:.4}, {:.4}]",
+              ref_data.data.iter().cloned().fold(f32::INFINITY, f32::min),
+              ref_data.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    // Diagnostic only — no strict assertion until we close the gap.
+    if max_abs > 0.5 {
+        eprintln!("  WARNING: log_mel_pre_normalize diverges; \
+                   inspect STFT framing or pad-mode");
+    }
 }
 
 #[test]

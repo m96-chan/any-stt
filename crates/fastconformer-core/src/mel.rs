@@ -49,6 +49,22 @@ const LOG_ZERO_GUARD: f32 = 1e-5;
 /// Audio is assumed to be 16 kHz mono f32 in [-1, 1]. Out-of-range values
 /// are not clamped — that is the caller's responsibility.
 pub fn log_mel_spectrogram(audio: &[f32], cfg: &Config) -> MelSpectrogram {
+    log_mel_spectrogram_internal(audio, cfg, /*normalize*/ true)
+}
+
+/// Diagnostic variant that skips per-feature normalization. Output is
+/// the raw `log(mel + 1e-5)` ready to compare against
+/// `torch.log(mel + 1e-5)` references.
+#[doc(hidden)]
+pub fn log_mel_spectrogram_no_normalize(audio: &[f32], cfg: &Config) -> MelSpectrogram {
+    log_mel_spectrogram_internal(audio, cfg, /*normalize*/ false)
+}
+
+fn log_mel_spectrogram_internal(
+    audio: &[f32],
+    cfg: &Config,
+    normalize: bool,
+) -> MelSpectrogram {
     assert_eq!(
         cfg.sample_rate, 16000,
         "only 16 kHz sample rate is wired; got {}",
@@ -113,17 +129,20 @@ pub fn log_mel_spectrogram(audio: &[f32], cfg: &Config) -> MelSpectrogram {
 
     let mut log_mel = vec![0.0_f32; n_frames * n_mels];
 
+    // torch.stft pads the window with zeros CENTERED in the n_fft
+    // buffer: leading zeros, then the win_length-long hann, then
+    // trailing zeros. Frame samples occupy the full n_fft window;
+    // multiplication by the centered window zeros out the edges.
+    let win_off = (n_fft - win_length) / 2;
     for t in 0..n_frames {
         let start = t * hop_length;
-        // torch.stft with win_length < n_fft pads the window with
-        // trailing zeros (window at fft_in[0..win_length], zeros after).
         for v in fft_in.iter_mut() {
             *v = 0.0;
         }
         for i in 0..win_length {
-            let src = start + i;
+            let src = start + win_off + i;
             if src < emph.len() {
-                fft_in[i] = emph[src] * hann[i];
+                fft_in[win_off + i] = emph[src] * hann[i];
             }
         }
 
@@ -152,8 +171,12 @@ pub fn log_mel_spectrogram(audio: &[f32], cfg: &Config) -> MelSpectrogram {
         }
     }
 
-    // 4. Per-feature normalization across time.
-    normalize_per_feature(&mut log_mel, n_frames, n_mels);
+    // 4. Per-feature normalization across time (matches NeMo's
+    //    `normalize=per_feature` default; can be skipped via the
+    //    `_no_normalize` variant for layer-by-layer comparison).
+    if normalize {
+        normalize_per_feature(&mut log_mel, n_frames, n_mels);
+    }
 
     MelSpectrogram {
         data: log_mel,

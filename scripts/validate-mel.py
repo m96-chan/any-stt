@@ -131,7 +131,32 @@ def main() -> int:
                 np.ascontiguousarray(torch.log(mel + args.log_eps).T.contiguous()
                                      .numpy().astype(np.float32)))
         np.save(debug_dir / "hann.npy", window.numpy().astype(np.float32))
-        np.save(debug_dir / "power_frame0.npy", power[:, 0].numpy().astype(np.float32))
+        np.save(debug_dir / "power_frame0.npy",
+                np.ascontiguousarray(power[:, 0].numpy().astype(np.float32)))
+        np.save(debug_dir / "power_frame100.npy",
+                np.ascontiguousarray(power[:, 100].numpy().astype(np.float32)))
+        np.save(debug_dir / "log_mel_frame100.npy",
+                np.ascontiguousarray(torch.log(mel + args.log_eps)[:, 100]
+                                     .numpy().astype(np.float32)))
+        # Frame 100's FFT input (windowed audio of length n_fft).
+        # Reproduce torch.stft's framing for verification: reflect-pad
+        # the preemph'd signal by n_fft/2 each side, then take the
+        # 100th frame at start = 100 * hop_length.
+        pad = args.n_fft // 2
+        padded = torch.nn.functional.pad(pre.unsqueeze(0), (pad, pad), mode="reflect").squeeze(0)
+        start = 100 * args.hop
+        frame = padded[start:start + args.n_fft].clone()
+        # Window: torch.stft pads window with trailing zeros to n_fft.
+        win_padded = torch.zeros(args.n_fft, dtype=torch.float32)
+        win_padded[:args.win] = window
+        windowed = frame * win_padded
+        np.save(debug_dir / "frame100_windowed.npy",
+                np.ascontiguousarray(windowed.numpy().astype(np.float32)))
+        # Frame 100's complex FFT output (re/im interleaved).
+        f100_fft = torch.fft.rfft(windowed, n=args.n_fft)
+        f100_fft_ri = torch.stack([f100_fft.real, f100_fft.imag], dim=1).flatten()
+        np.save(debug_dir / "frame100_fft_re_im.npy",
+                np.ascontiguousarray(f100_fft_ri.numpy().astype(np.float32)))
         print(f"  wrote intermediate fixtures to {debug_dir}/")
     return 0
 
