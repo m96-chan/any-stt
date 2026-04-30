@@ -95,13 +95,87 @@ pub struct RnntDecoder {
 }
 
 impl RnntDecoder {
-    /// Build the decoder from a GGUF model. Not yet wired — needs the
-    /// real `dec.*` and `joint.*` tensor names which only solidify once
-    /// we run the converter on a real `.nemo` file.
-    pub fn from_gguf(_gguf: &GgufFile, _cfg: Config) -> Result<Self, String> {
-        Err("RnntDecoder::from_gguf not yet implemented — \
-             needs `dec.rnn.*` and `joint.*` tensor wire-up"
-            .into())
+    /// Build the decoder from a GGUF model produced by
+    /// `scripts/convert-nemo-to-gguf.py`. Tensor names follow that
+    /// converter's rename table:
+    ///
+    /// - `dec.embed.weight`             [vocab_with_blank, pred_hidden]
+    /// - `dec.rnn.{L}.weight_ih`        [pred_hidden, 4*pred_hidden]
+    /// - `dec.rnn.{L}.weight_hh`        [pred_hidden, 4*pred_hidden]
+    /// - `dec.rnn.{L}.bias_ih`          [4*pred_hidden]
+    /// - `dec.rnn.{L}.bias_hh`          [4*pred_hidden]
+    /// - `joint.enc.weight`             [d_model, joint_hidden]
+    /// - `joint.enc.bias`               [joint_hidden]
+    /// - `joint.pred.weight`            [pred_hidden, joint_hidden]
+    /// - `joint.pred.bias`              [joint_hidden]
+    /// - `joint.fc2.weight`             [joint_hidden, vocab_with_blank]
+    /// - `joint.fc2.bias`               [vocab_with_blank]
+    pub fn from_gguf(gguf: &GgufFile, cfg: Config) -> Result<Self, String> {
+        let pred_hidden = cfg.pred_hidden as usize;
+        let joint_hidden = cfg.joint_hidden as usize;
+        let d_model = cfg.d_model as usize;
+        // NeMo's embedding row count includes a slot for blank even
+        // though blank is never an LSTM input. Use the actual file's
+        // row count rather than `cfg.vocab_size`.
+        let embedding = gguf.dequantize_f32("dec.embed.weight")?;
+        if embedding.len() % pred_hidden != 0 {
+            return Err(format!(
+                "dec.embed.weight size {} not a multiple of pred_hidden={}",
+                embedding.len(),
+                pred_hidden
+            ));
+        }
+        let vocab_with_blank = embedding.len() / pred_hidden;
+
+        // Discover LSTM layers: L = 0, 1, ... while `dec.rnn.{L}.*` exists.
+        let mut layers = Vec::new();
+        for l in 0_usize.. {
+            let key = format!("dec.rnn.{l}.weight_ih");
+            if !gguf.has_tensor(&key) {
+                break;
+            }
+            let w_ih = gguf.dequantize_f32(&format!("dec.rnn.{l}.weight_ih"))?;
+            let w_hh = gguf.dequantize_f32(&format!("dec.rnn.{l}.weight_hh"))?;
+            let b_ih = gguf.dequantize_f32(&format!("dec.rnn.{l}.bias_ih"))?;
+            let b_hh = gguf.dequantize_f32(&format!("dec.rnn.{l}.bias_hh"))?;
+            // PyTorch nn.LSTM: weight_ih = [4H, input_size], weight_hh =
+            // [4H, H]. After flattening row-major the size is the same.
+            // input_size = pred_hidden for layer 0 and for stacked LSTM
+            // layers (NeMo uses fixed hidden_size between layers).
+            layers.push(LstmLayerWeights {
+                input_size: pred_hidden,
+                hidden_size: pred_hidden,
+                w_ih,
+                w_hh,
+                b_ih,
+                b_hh,
+            });
+        }
+        if layers.is_empty() {
+            return Err("no `dec.rnn.0.*` tensors found".into());
+        }
+
+        let pred = PredictionNetwork::from_test_weights(
+            embedding,
+            pred_hidden,
+            vocab_with_blank,
+            layers,
+        );
+
+        let joint = JointNetwork::from_test_weights(
+            d_model,
+            pred_hidden,
+            joint_hidden,
+            vocab_with_blank,
+            gguf.dequantize_f32("joint.enc.weight")?,
+            gguf.dequantize_f32("joint.enc.bias")?,
+            gguf.dequantize_f32("joint.pred.weight")?,
+            gguf.dequantize_f32("joint.pred.bias")?,
+            gguf.dequantize_f32("joint.fc2.weight")?,
+            gguf.dequantize_f32("joint.fc2.bias")?,
+        );
+
+        Self::from_weights(cfg, pred, joint)
     }
 
     /// Build a decoder directly from in-memory weights (used by unit tests
@@ -117,9 +191,13 @@ impl RnntDecoder {
                 pred.pred_hidden, joint.pred_hidden
             ));
         }
-        if pred.vocab_size + 1 != joint.vocab_size_with_blank {
+        // pred.vocab_size is the embedding row count and includes a
+        // slot for blank when the model is loaded from NeMo. The joint
+        // network's output also includes the blank slot, so the two
+        // must match exactly.
+        if pred.vocab_size != joint.vocab_size_with_blank {
             return Err(format!(
-                "vocab mismatch: pred={} joint(includes blank)={}",
+                "vocab mismatch: pred.vocab_size={} joint.vocab_with_blank={}",
                 pred.vocab_size, joint.vocab_size_with_blank
             ));
         }
@@ -352,9 +430,13 @@ mod tests {
         let pred_h = 3;
         let joint_h = 5;
 
+        // NeMo convention: the embedding has a row for blank as well.
+        let blank = vocab_size; // last index is blank in joint output
+        let vocab_with_blank = vocab_size + 1;
+
         // Embedding: token i → vector of i*0.1 + k*0.01 (deterministic).
-        let mut emb = vec![0.0_f32; vocab_size * pred_h];
-        for tok in 0..vocab_size {
+        let mut emb = vec![0.0_f32; vocab_with_blank * pred_h];
+        for tok in 0..vocab_with_blank {
             for k in 0..pred_h {
                 emb[tok * pred_h + k] = (tok as f32) * 0.1 + (k as f32) * 0.01;
             }
@@ -368,23 +450,27 @@ mod tests {
             b_ih: vec![0.0; 4 * pred_h],
             b_hh: vec![0.0; 4 * pred_h],
         }];
-        let pred = PredictionNetwork::from_test_weights(emb, pred_h, vocab_size, layers);
+        let pred = PredictionNetwork::from_test_weights(
+            emb,
+            pred_h,
+            vocab_with_blank,
+            layers,
+        );
 
-        let blank = vocab_size; // last index is blank in joint output
-        let vsb = vocab_size + 1;
         let w_enc = vec![0.0; joint_h * enc_dim];
         let b_enc = vec![0.0; joint_h];
         let w_pred = vec![0.0; joint_h * pred_h];
         let b_pred = vec![0.0; joint_h];
-        let w_out = vec![0.0_f32; vsb * joint_h];
-        let mut b_out = vec![0.0_f32; vsb];
+        let w_out = vec![0.0_f32; vocab_with_blank * joint_h];
+        let mut b_out = vec![0.0_f32; vocab_with_blank];
         if force_blank {
             b_out[blank] = 100.0;
         } else {
             b_out[1] = 100.0;
         }
         let joint = JointNetwork::from_test_weights(
-            enc_dim, pred_h, joint_h, vsb, w_enc, b_enc, w_pred, b_pred, w_out, b_out,
+            enc_dim, pred_h, joint_h, vocab_with_blank, w_enc, b_enc, w_pred,
+            b_pred, w_out, b_out,
         );
 
         let mut cfg = Config::dummy_reazonspeech_nemo_v2();

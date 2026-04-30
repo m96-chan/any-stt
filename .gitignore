@@ -1,2 +1,4 @@
 /target
 /weights_tiny_en/
+scripts/__pycache__/
+*.pyc

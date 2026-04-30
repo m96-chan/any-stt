@@ -141,7 +141,8 @@ impl Config {
             vocab_size: 3000,
             pred_hidden: 640,
             joint_hidden: 640,
-            blank_id: 2999,
+            // NeMo appends blank after the regular vocab; blank index = vocab_size.
+            blank_id: 3000,
             sample_rate: 16000,
             win_length: 400,
             hop_length: 160,
@@ -166,7 +167,8 @@ impl Config {
             vocab_size: 8192,
             pred_hidden: 640,
             joint_hidden: 640,
-            blank_id: 8191,
+            // Blank appended after vocab (NeMo TDT same convention).
+            blank_id: 8192,
             sample_rate: 16000,
             win_length: 400,
             hop_length: 160,
