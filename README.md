@@ -223,6 +223,8 @@ whisper-backend = { path = "crates/whisper-backend" }
 
 ## Supported Models
 
+### Whisper family (production-ready)
+
 All Whisper-architecture models in ggml/GGUF format.
 
 | Model | Params | Size (F16) | Quality | Notes |
@@ -233,6 +235,28 @@ All Whisper-architecture models in ggml/GGUF format.
 | large-v3-turbo | 809M | 1.6 GB | Near-best | Speed+quality |
 | kotoba-v2.0 | 1550M | 1.4 GB (F16) | Best Japanese | Distilled decoder |
 
+### NeMo FastConformer family (in development)
+
+| Model | Params | Status | Notes |
+|-------|--------|--------|-------|
+| reazonspeech-nemo-v2 (`reazonspeech-backend`) | 619M | mel ✅ NeMo-compat, encoder forward ⚠️ drift | Japanese; FastConformer + Longformer attn + RNN-T |
+| parakeet-tdt-0.6b-v3 (`parakeet-backend`)     | 600M | skeleton ✅, weights not yet downloaded         | 25 European languages; FastConformer + rel-pos + TDT |
+
+The `mel` preprocessor is bit-equivalent to NeMo's
+`AudioToMelSpectrogramPreprocessor` (max_abs vs reference: **8.9e-5** on
+real Japanese audio). Stage-by-stage validation harness in
+`crates/fastconformer-core/tests/layer_reference.rs`. The encoder body
+runs end-to-end on real GGUFs but produces drifted output — fix is
+tracked under `#N9` (see `crates/fastconformer-core/README.md`).
+
+### Qwen3-ASR family (planned)
+
+| Model | Status |
+|-------|--------|
+| Qwen3-ASR-1.7B (`qwen-asr-backend`) | runtime decided (`llama-cpp-2` + `mtmd`); skeleton only |
+
+See [docs/qwen-asr-runtime-decision.md](docs/qwen-asr-runtime-decision.md).
+
 ### GGUF Conversion
 
 ```bash
@@ -241,6 +265,12 @@ python3 scripts/convert-to-gguf.py tiny.en output.gguf
 
 # Kotoba (HuggingFace) → ggml
 python3 scripts/convert-kotoba-to-ggml.py
+
+# NeMo FastConformer (.nemo) → GGUF v3
+python3 scripts/convert-nemo-to-gguf.py model.nemo output.gguf
+
+# Validate the mel preprocessor matches NeMo numerics
+python3 scripts/validate-mel.py --audio audio.wav --out mel_ref.npy
 ```
 
 ## Tests
