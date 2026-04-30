@@ -37,7 +37,10 @@ pub use attention::{AttentionMode, MultiHeadAttention};
 pub use block::ConformerBlock;
 pub use conv_module::ConvModule;
 pub use ff::FeedForward;
-pub use subsample::{subsampled_mel_dim, subsampled_time_dim, Subsample};
+pub use subsample::{
+    subsampled_mel_dim, subsampled_time_dim, Subsample, SubsampleDwStriding,
+    SubsampleStriding,
+};
 
 /// Output of the encoder forward pass.
 #[derive(Debug)]
@@ -162,7 +165,7 @@ mod tests {
         let channels = 8;
         let feat_per_step = channels * n_mels_out;
 
-        let subsample = Subsample {
+        let subsample = Subsample::Striding(SubsampleStriding {
             n_mels: 8,
             d_model: 8,
             n_mels_out,
@@ -175,7 +178,7 @@ mod tests {
             conv2_bias: vec![0.0; channels],
             out_weight: vec![0.0; 8 * feat_per_step],
             out_bias: vec![0.0; 8],
-        };
+        });
 
         let blocks = vec![zero_block(8, 2, 3)];
         let enc = FastConformerEncoder {
@@ -212,7 +215,7 @@ mod tests {
         let n_mels_out = subsampled_mel_dim(8);
         let channels = 8;
         let feat_per_step = channels * n_mels_out;
-        let subsample = Subsample {
+        let subsample = Subsample::Striding(SubsampleStriding {
             n_mels: 8,
             d_model: 8,
             n_mels_out,
@@ -225,7 +228,7 @@ mod tests {
             conv2_bias: vec![0.0; channels],
             out_weight: vec![0.0; 8 * feat_per_step],
             out_bias: vec![0.0; 8],
-        };
+        });
         // Use a Longformer block.
         let mut blk = zero_block(8, 2, 3);
         blk.attn_mode = AttentionMode::LocalGlobal {

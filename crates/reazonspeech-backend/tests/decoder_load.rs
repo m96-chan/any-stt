@@ -87,6 +87,58 @@ fn rnnt_decoder_greedy_runs_on_synthetic_encoder_output() {
     let tokens = decoder.greedy_decode(&enc);
     eprintln!("synthetic decode emitted {} tokens", tokens.len());
     // No assertion on transcript content — this just verifies stability.
+    let _ = tokens.len();
+}
+
+#[test]
+fn full_encoder_load_and_forward_runs_against_reazonspeech() {
+    // End-to-end smoke test: load encoder + decoder from real GGUF,
+    // run a short audio through mel → encoder → decoder pipeline,
+    // verify it terminates without error or panic. Numerical
+    // correctness against the Python reference is in #N9.
+    let path = match pick_fixture() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIPPED: no reazonspeech GGUF found");
+            return;
+        }
+    };
+
+    let gguf = GgufFile::open(&path).expect("open gguf");
+    let cfg = Config::from_gguf(&gguf).expect("parse config");
+
+    let encoder = reazonspeech_backend::encoder::load(&gguf, cfg.clone())
+        .expect("encoder load");
+    let decoder = RnntDecoder::from_gguf(&gguf, cfg.clone())
+        .expect("decoder load");
+
+    // Synthetic audio: 0.5s of zeros at 16 kHz. Real transcription
+    // requires real audio + correct mel preprocessor. This just
+    // exercises the call graph.
+    let audio = vec![0.0_f32; 8000];
+    let mel = fastconformer_core::log_mel_spectrogram(&audio, &cfg);
+    eprintln!(
+        "mel: {} frames × {} mels",
+        mel.n_frames, mel.n_mels
+    );
+
+    let enc_out = encoder
+        .forward(&mel.data, mel.n_frames)
+        .expect("encoder forward");
+    eprintln!(
+        "encoder out: {} frames × {} d_model",
+        enc_out.n_frames, enc_out.d_model
+    );
+    assert_eq!(enc_out.d_model, cfg.d_model as usize);
+    // Encoder reduces time by 8× (subsampling factor).
+    assert!(enc_out.n_frames > 0, "encoder produced 0 frames");
+    assert!(enc_out.n_frames <= mel.n_frames / 4, "subsampling didn't reduce");
+
+    let tokens = decoder.greedy_decode(&enc_out);
+    eprintln!(
+        "transcribe of zeros emitted {} tokens (no validation)",
+        tokens.len()
+    );
     // Zero input passes through tanh+linear to a constant joint output
     // whose argmax may or may not be blank. The MAX_EMIT_PER_FRAME=30
     // guard caps each frame's emit count, so 50 frames × 30 = 1500 is
