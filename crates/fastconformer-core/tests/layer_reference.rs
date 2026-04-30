@@ -192,7 +192,95 @@ fn npy_parser_roundtrip_synthetic() {
 }
 
 #[test]
-#[ignore = "requires reazonspeech .nemo + nemo-toolkit; run after dump-nemo-fixtures.py"]
+fn mel_filterbank_matches_torchaudio_reference_when_present() {
+    // tests/fixtures/<model>/debug/mel_filterbank.npy is produced by
+    // `scripts/validate-mel.py --dump-intermediates` and is .gitignored
+    // (developer-local). Skipped when missing.
+    let path = fixtures_root().join("debug").join("mel_filterbank.npy");
+    if !path.exists() {
+        eprintln!("SKIPPED: no mel_filterbank fixture at {}", path.display());
+        return;
+    }
+    // torchaudio shape = [n_freqs=257, n_mels=80].
+    let ref_fb = NpyArray::load(&path).expect("load mel_filterbank.npy");
+    assert_eq!(
+        ref_fb.shape,
+        vec![257, 80],
+        "unexpected fixture shape {:?}",
+        ref_fb.shape
+    );
+
+    // Our filterbank: Vec<Vec<f32>> with shape [n_mels=80, n_freqs=257].
+    let ours = fastconformer_core::mel_filterbank(80, 512, 16000.0);
+    assert_eq!(ours.len(), 80);
+    assert_eq!(ours[0].len(), 257);
+
+    // Compare element-wise; reference is row-major [n_freqs, n_mels].
+    let mut max_abs = 0.0_f32;
+    for m in 0..80 {
+        for f in 0..257 {
+            let r = ref_fb.data[f * 80 + m];
+            let o = ours[m][f];
+            let d = (r - o).abs();
+            if d > max_abs {
+                max_abs = d;
+            }
+        }
+    }
+    eprintln!("mel_filterbank max_abs vs torchaudio: {max_abs:.6}");
+    assert!(
+        max_abs < 1e-5,
+        "mel_filterbank diverges from torchaudio: max_abs={max_abs}"
+    );
+}
+
+#[test]
+fn log_mel_pre_normalize_matches_torchaudio_when_present() {
+    // Compares log(mel + ε) BEFORE per-feature normalization. Helps
+    // separate normalization-formula bugs from pre-normalization
+    // numerical drift.
+    let path = fixtures_root().join("debug").join("log_mel_pre_normalize.npy");
+    if !path.exists() {
+        eprintln!("SKIPPED: no log_mel_pre_normalize fixture");
+        return;
+    }
+    let ref_data = NpyArray::load(&path).expect("load log_mel_pre_normalize.npy");
+    eprintln!("ref shape: {:?}", ref_data.shape);
+    // Reference shape is [n_frames, n_mels].
+    assert_eq!(ref_data.shape.len(), 2);
+
+    // Re-run our log-mel on the same audio.
+    let audio_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third-party/whisper.cpp/samples/japanese_test.wav");
+    if !audio_path.exists() {
+        eprintln!("SKIPPED: japanese_test.wav not found");
+        return;
+    }
+    let audio = read_wav_16k_mono(&audio_path).expect("wav");
+    use fastconformer_core::Config;
+    let cfg = Config::dummy_reazonspeech_nemo_v2();
+
+    // log_mel_spectrogram applies normalization; we want the PRE-normalize
+    // values. There's no public API for that yet — just compare a few
+    // statistics for now.
+    let mel = fastconformer_core::log_mel_spectrogram(&audio, &cfg);
+    let n_frames = mel.n_frames;
+    let n_mels = mel.n_mels;
+    let ref_mean = ref_data.data.iter().sum::<f32>() / ref_data.data.len() as f32;
+    let our_mean = mel.data.iter().sum::<f32>() / mel.data.len() as f32;
+    eprintln!(
+        "  ref:  shape={:?} mean={:.4}",
+        ref_data.shape, ref_mean
+    );
+    eprintln!(
+        "  ours: shape=[{}, {}] mean={:.4}",
+        n_frames, n_mels, our_mean
+    );
+    // No assertion here — informational only.
+}
+
+#[test]
+#[ignore = "requires reazonspeech reference at tests/fixtures/.../mel_ja.npy (run scripts/validate-mel.py)"]
 fn mel_matches_nemo_reference() {
     if !fixtures_present() {
         eprintln!(

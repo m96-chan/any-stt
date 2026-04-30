@@ -37,6 +37,8 @@ def main() -> int:
     ap.add_argument("--n-fft", type=int, default=512)
     ap.add_argument("--preemph", type=float, default=0.97)
     ap.add_argument("--log-eps", type=float, default=1e-5)
+    ap.add_argument("--dump-intermediates", action="store_true",
+                    help="dump preemph/hann/mel_fb/log_mel_pre_normalize")
     args = ap.parse_args()
 
     try:
@@ -118,6 +120,19 @@ def main() -> int:
     print(f"  range: [{out.min():.4f}, {out.max():.4f}]")
     print(f"  per-feature mean (first 5): {out.mean(axis=0)[:5]}")
     print(f"  per-feature std  (first 5): {out.std(axis=0)[:5]}")
+
+    # Optional intermediate dumps to help triangulate where Rust drifts.
+    if args.dump_intermediates:
+        debug_dir = args.out.parent / "debug"
+        debug_dir.mkdir(exist_ok=True)
+        np.save(debug_dir / "preemph.npy", pre.numpy().astype(np.float32))
+        np.save(debug_dir / "mel_filterbank.npy", mel_fb.numpy().astype(np.float32))
+        np.save(debug_dir / "log_mel_pre_normalize.npy",
+                np.ascontiguousarray(torch.log(mel + args.log_eps).T.contiguous()
+                                     .numpy().astype(np.float32)))
+        np.save(debug_dir / "hann.npy", window.numpy().astype(np.float32))
+        np.save(debug_dir / "power_frame0.npy", power[:, 0].numpy().astype(np.float32))
+        print(f"  wrote intermediate fixtures to {debug_dir}/")
     return 0
 
 

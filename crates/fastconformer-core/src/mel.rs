@@ -180,9 +180,12 @@ fn hann_window(n: usize) -> Vec<f32> {
 
 /// Mel-filterbank matrix, slaney scale (matches librosa default + NeMo).
 ///
-/// Returns `n_mels` filters, each of length `n_fft / 2 + 1`. Sums to 1.0
-/// across active bins by triangle area normalization (slaney-style).
-fn mel_filterbank(n_mels: usize, n_fft: usize, sample_rate: f32) -> Vec<Vec<f32>> {
+/// Returns `n_mels` filters, each of length `n_fft / 2 + 1`. Each filter
+/// is a triangle in mel space, area-normalized via Slaney convention
+/// (`enorm = 2 / (high_hz - low_hz)`). The resulting matrix matches
+/// `torchaudio.functional.melscale_fbanks(norm="slaney", mel_scale="slaney")`
+/// up to float epsilon.
+pub fn mel_filterbank(n_mels: usize, n_fft: usize, sample_rate: f32) -> Vec<Vec<f32>> {
     let n_bins = n_fft / 2 + 1;
     let f_min = 0.0_f32;
     let f_max = sample_rate / 2.0;
