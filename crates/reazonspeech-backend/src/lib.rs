@@ -20,14 +20,10 @@
 //!
 //! # Status
 //!
-//! - mel + tokenizer + RNN-T greedy: implemented (#N4)
-//! - encoder forward (Conformer block, Longformer attention): implemented
-//!   (#N7) — RelPosLocalAttn dispatched through `AttentionMode::LocalGlobal`
-//! - RNN-T decoder GGUF loader: stub (blocked by #N8 — needs real .nemo)
-//!
-//! `transcribe()` runs mel → encoder.forward end-to-end and surfaces
-//! `NotImplemented` at the RNN-T decoder GGUF loader seam, the only
-//! remaining stub.
+//! End-to-end pure-Rust path verified against NeMo on
+//! `samples/japanese_test.wav`: greedy decode produces the same 27 token
+//! IDs as NeMo's `EncDecRNNTBPEModel.transcribe()` greedy/beam.
+//! See `tests/encoder_ref_decode.rs::rust_full_pipeline_decodes_japanese_test_wav`.
 
 pub mod decoder;
 pub mod encoder;

@@ -55,29 +55,84 @@ pub struct FastConformerEncoder {
     pub cfg: Config,
     pub subsample: Subsample,
     pub blocks: Vec<ConformerBlock>,
-    /// Final LayerNorm γ over the last block's output (length d_model).
-    pub ln_post_gamma: Vec<f32>,
-    pub ln_post_beta: Vec<f32>,
 }
 
 impl FastConformerEncoder {
     /// Run the encoder on a `[time, n_mels]` mel spectrogram.
+    ///
+    /// Follows NeMo `ConformerEncoder.forward_internal`:
+    /// 1. Subsample (Conv2d stack → Linear)
+    /// 2. `x = x * sqrt(d_model)` when `xscaling=True` (NeMo's `PositionalEncoding`
+    ///    applies this inside `pos_enc.forward`)
+    /// 3. N Conformer blocks (each has its own `norm_out`)
+    /// 4. **No final LN**: NeMo's encoder has no extra layer norm at this
+    ///    level — each block's `norm_out` is the last operation. (There
+    ///    is an optional `out_proj` Linear, but reazonspeech-nemo-v2 has
+    ///    `feat_out: -1` so it is None.)
     pub fn forward(&self, mel: &[f32], n_frames: usize) -> Result<EncoderOutput, String> {
         let dm = self.cfg.d_model as usize;
-        // Both AttentionType::RelPos and AttentionType::RelPosLocalAttn
-        // are now handled through AttentionMode on each block.
 
         // 1) Subsample.
         let (mut x, t_out) = self.subsample.forward(mel, n_frames);
 
-        // 2) N Conformer blocks.
-        for block in &self.blocks {
-            block.forward(&mut x, t_out);
+        // 2) xscaling — multiply by sqrt(d_model). NeMo defaults to True.
+        let xscale = (dm as f32).sqrt();
+        for v in x.iter_mut() {
+            *v *= xscale;
         }
 
-        // 3) Final LN.
-        layer_norm_rows(&mut x, t_out, dm, &self.ln_post_gamma, &self.ln_post_beta, 1e-5);
+        // NeMo's mel preprocessor returns one trailing padded frame relative
+        // to `seq_len = audio_len / hop_length`. Compute the effective valid
+        // subsampled length the same way: NeMo does `length // subsample_factor`
+        // floor, with subsample_factor = 8 for dw_striding × 3 stride-2 stages.
+        // We default to "n_frames-1 → ceil(/8) = t_out - 0 or 1" depending on
+        // alignment. For now: when n_frames is not a multiple of the subsample
+        // factor, the encoder treats the last subsample frame as padding.
+        let subsample_factor = 8usize;
+        let valid_input = n_frames.saturating_sub(1); // drop one trailing pad frame
+        let valid_frames = (valid_input / subsample_factor).min(t_out);
 
+        // 3) N Conformer blocks. Pass `valid_frames` so each block's conv
+        //    module can mask the trailing padded frames before depthwise conv.
+        for block in &self.blocks {
+            block.forward_masked(&mut x, t_out, valid_frames);
+        }
+
+        Ok(EncoderOutput {
+            data: x,
+            n_frames: t_out,
+            d_model: dm,
+        })
+    }
+
+    /// Same as `forward` but invokes `dump(name, x_snapshot)` after each
+    /// stage. Used by `tests/layer_reference.rs` to compare against NeMo
+    /// truth dumps. The callback receives:
+    /// - `"after_pre_encode"` after subsample, BEFORE xscale (matches the
+    ///   tensor NeMo's `pre_encode` returns).
+    /// - `"after_xscale"` after the xscale multiply.
+    /// - `"block_{i}_out"` after each Conformer block.
+    pub fn forward_dump(
+        &self,
+        mel: &[f32],
+        n_frames: usize,
+        mut dump: impl FnMut(&str, &[f32]),
+    ) -> Result<EncoderOutput, String> {
+        let dm = self.cfg.d_model as usize;
+        let (mut x, t_out) = self.subsample.forward(mel, n_frames);
+        dump("after_pre_encode", &x);
+        let xscale = (dm as f32).sqrt();
+        for v in x.iter_mut() {
+            *v *= xscale;
+        }
+        dump("after_xscale", &x);
+        let subsample_factor = 8usize;
+        let valid_input = n_frames.saturating_sub(1);
+        let valid_frames = (valid_input / subsample_factor).min(t_out);
+        for (i, block) in self.blocks.iter().enumerate() {
+            block.forward_masked(&mut x, t_out, valid_frames);
+            dump(&format!("block_{i}_out"), &x);
+        }
         Ok(EncoderOutput {
             data: x,
             n_frames: t_out,
@@ -110,6 +165,7 @@ mod tests {
                 q_weight: vec![0.0; d_model * d_model],
                 q_bias: vec![0.0; d_model],
                 k_weight: vec![0.0; d_model * d_model],
+                k_bias: vec![0.0; d_model],
                 v_weight: vec![0.0; d_model * d_model],
                 v_bias: vec![0.0; d_model],
                 out_weight: vec![0.0; d_model * d_model],
@@ -185,8 +241,6 @@ mod tests {
             cfg,
             subsample,
             blocks,
-            ln_post_gamma: vec![1.0; 8],
-            ln_post_beta: vec![0.0; 8],
         };
 
         let mel = vec![0.0_f32; 16 * 8];
@@ -239,8 +293,6 @@ mod tests {
             cfg,
             subsample,
             blocks: vec![blk],
-            ln_post_gamma: vec![1.0; 8],
-            ln_post_beta: vec![0.0; 8],
         };
         let mel = vec![0.0_f32; 16 * 8];
         let out = enc.forward(&mel, 16).unwrap();

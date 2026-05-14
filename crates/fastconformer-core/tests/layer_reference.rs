@@ -575,6 +575,50 @@ fn mel_matches_nemo_reference() {
     assert!(max_abs < 1e-2, "mel max_abs={max_abs} exceeds 1e-2");
 }
 
+/// Compare Rust mel output against the ground-truth NeMo preprocessor
+/// dump from `scripts/nemo-truth-dump.py`. Skipped when not present.
+#[test]
+fn mel_matches_nemo_truth_when_present() {
+    let path = fixtures_root().join("encoder_truth").join("mel.npy");
+    if !path.exists() {
+        eprintln!("SKIPPED: no NeMo truth mel at {}", path.display());
+        return;
+    }
+    let ref_mel = NpyArray::load(&path).expect("load mel.npy");
+    let audio_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third-party/whisper.cpp/samples/japanese_test.wav");
+    let audio = read_wav_16k_mono(&audio_path).expect("wav");
+    let cfg = Config::dummy_reazonspeech_nemo_v2();
+    let mel = log_mel_spectrogram(&audio, &cfg);
+    assert_eq!(mel.n_frames, ref_mel.shape[0], "frame count");
+    assert_eq!(mel.n_mels, ref_mel.shape[1], "n_mels");
+    // NeMo's preprocessor zero-pads the trailing frame beyond `seq_len`
+    // (proc_len = n_frames - 1 in this case). Exclude that frame from the
+    // comparison since it is meaningless padding on NeMo's side.
+    let valid_frames = mel.n_frames - 1;
+    let valid_len = valid_frames * mel.n_mels;
+    let (max_abs, max_rel) = max_diff(&mel.data[..valid_len], &ref_mel.data[..valid_len]);
+    eprintln!("mel vs NeMo truth: max_abs={max_abs:.6e} max_rel={max_rel:.6} (valid frames 0..{valid_frames})");
+    // Find argmax of diff to localize divergence.
+    let mut worst = (0usize, 0usize, 0.0_f32);
+    for t in 0..valid_frames {
+        for m in 0..mel.n_mels {
+            let i = t * mel.n_mels + m;
+            let d = (mel.data[i] - ref_mel.data[i]).abs();
+            if d > worst.2 {
+                worst = (t, m, d);
+            }
+        }
+    }
+    eprintln!("  worst diff at (t={}, m={}): ours={} truth={}",
+              worst.0, worst.1,
+              mel.data[worst.0 * mel.n_mels + worst.1],
+              ref_mel.data[worst.0 * mel.n_mels + worst.1]);
+    eprintln!("  ours [0,:5]: {:?}", &mel.data[..5]);
+    eprintln!("  truth[0,:5]: {:?}", &ref_mel.data[..5]);
+    assert!(max_abs < 0.1, "mel divergence too large: {max_abs}");
+}
+
 fn read_wav_16k_mono(path: &Path) -> Result<Vec<f32>, String> {
     // Lightweight WAV reader for tests — avoids pulling `hound` into
     // fastconformer-core.

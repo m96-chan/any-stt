@@ -212,11 +212,15 @@ impl RnntDecoder {
         let blank = self.cfg.blank_id;
         let mut emitted = Vec::new();
         let mut state = LstmState::zeros(&self.pred.layers);
-        // Initial pred_h: zero vector (no token has been emitted yet).
-        // NeMo's RNN-T does the same — the LSTM is conditioned only on
-        // the sequence of *non-blank* emissions, and the joint network
-        // starts from zero state.
+        // Initial pred_h: NeMo prepends a *zero embedding* and steps the
+        // LSTM once with zero state. The LSTM gate biases make the result
+        // non-zero. We replicate that here so the first frame's joint sees
+        // the same conditioning NeMo's greedy does.
+        // (NeMo: `start = torch.zeros((B, 1, H)); y = cat([start, y]); g = LSTM(y, state)`.)
         let mut pred_h = vec![0.0_f32; self.pred.pred_hidden];
+        for (layer, (h, c)) in self.pred.layers.iter().zip(state.layers.iter_mut()) {
+            pred_h = layer.step(&pred_h, h, c);
+        }
 
         // Cap on emissions per frame to guard against degenerate models
         // that would otherwise loop forever picking non-blank.
@@ -362,7 +366,10 @@ impl JointNetwork {
         }
     }
 
-    /// `joint(enc, pred) = w_out · tanh(W_enc·enc + b_enc + W_pred·pred + b_pred) + b_out`
+    /// `joint(enc, pred) = w_out · relu(W_enc·enc + b_enc + W_pred·pred + b_pred) + b_out`
+    ///
+    /// NeMo's RNN-T joint uses `activation: relu` by default (see
+    /// reazonspeech-nemo-v2's model_config.yaml: `jointnet.activation: relu`).
     fn forward(&self, enc: &[f32], pred: &[f32]) -> Vec<f32> {
         debug_assert_eq!(enc.len(), self.encoder_dim);
         debug_assert_eq!(pred.len(), self.pred_hidden);
@@ -374,7 +381,8 @@ impl JointNetwork {
         let mut pp = vec![0.0_f32; self.joint_hidden];
         matvec_add(&self.w_pred, pred, &mut pp);
         for j in 0..self.joint_hidden {
-            hidden[j] = (hidden[j] + pp[j] + self.b_pred[j]).tanh();
+            let s = hidden[j] + pp[j] + self.b_pred[j];
+            hidden[j] = if s > 0.0 { s } else { 0.0 };
         }
         let mut out = vec![0.0_f32; self.vocab_size_with_blank];
         matvec_add(&self.w_out, &hidden, &mut out);
