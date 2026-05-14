@@ -99,21 +99,10 @@ pub fn load(gguf: &GgufFile, cfg: Config) -> Result<FastConformerEncoder, String
         blocks.push(block);
     }
 
-    // NeMo Conformer's encoder doesn't have a final post-LN; each block
-    // owns its own. Default to identity (γ=1, β=0) when absent.
-    let ln_post_gamma = gguf
-        .dequantize_f32("enc.ln_post.weight")
-        .unwrap_or_else(|_| vec![1.0; dm]);
-    let ln_post_beta = gguf
-        .dequantize_f32("enc.ln_post.bias")
-        .unwrap_or_else(|_| vec![0.0; dm]);
-
     Ok(FastConformerEncoder {
         cfg,
         subsample,
         blocks,
-        ln_post_gamma,
-        ln_post_beta,
     })
 }
 
@@ -149,6 +138,9 @@ fn load_block(
             .dequantize_f32(&format!("{pfx}.attn.q.bias"))
             .unwrap_or_else(|_| vec![0.0; dm]),
         k_weight: gguf.dequantize_f32(&format!("{pfx}.attn.k.weight"))?,
+        k_bias: gguf
+            .dequantize_f32(&format!("{pfx}.attn.k.bias"))
+            .unwrap_or_else(|_| vec![0.0; dm]),
         v_weight: gguf.dequantize_f32(&format!("{pfx}.attn.v.weight"))?,
         v_bias: gguf
             .dequantize_f32(&format!("{pfx}.attn.v.bias"))

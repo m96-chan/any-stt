@@ -42,7 +42,10 @@ impl MelSpectrogram {
 /// Pre-emphasis coefficient used by NeMo (`preemph` default).
 const PREEMPH: f32 = 0.97;
 /// Log compression floor used by NeMo (`log_zero_guard_value` default).
-const LOG_ZERO_GUARD: f32 = 1e-5;
+/// NeMo's default in `FilterbankFeatures.__init__` is `2 ** -24` ≈ 5.96e-8,
+/// not 1e-5. Using the wrong floor changes log-values in silent regions
+/// by ~7 nats which propagates into the per-feature normalization.
+const LOG_ZERO_GUARD: f32 = 5.960_464_5e-8; // 2^-24
 
 /// Compute log-mel filterbank features for `audio` using `cfg`.
 ///
@@ -306,8 +309,10 @@ fn normalize_per_feature(data: &mut [f32], n_frames: usize, n_mels: usize) {
             var[m] += d * d;
         }
     }
-    // NeMo formula: std = sqrt(var) + 1e-5 (additive epsilon, not clamp).
-    let std: Vec<f64> = var.iter().map(|&v| (v * inv_n).sqrt() + 1e-5).collect();
+    // NeMo `normalize_batch` uses Bessel-corrected std (divide by N-1, not N)
+    // and adds CONSTANT=1e-5 to the std to avoid div-by-zero — match exactly.
+    let denom = if n_frames > 1 { (n_frames - 1) as f64 } else { 1.0 };
+    let std: Vec<f64> = var.iter().map(|&v| (v / denom).sqrt() + 1e-5).collect();
     for t in 0..n_frames {
         for m in 0..n_mels {
             let i = t * n_mels + m;

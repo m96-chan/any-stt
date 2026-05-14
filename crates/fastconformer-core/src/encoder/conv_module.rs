@@ -50,7 +50,25 @@ pub struct ConvModule {
 impl ConvModule {
     /// Apply conv-module residual: `x ← x + ConvModule(x)`.
     /// `x` is `[time, d_model]` row-major.
+    pub fn forward_residual_no_ln(&self, x: &mut [f32], time: usize) {
+        self.forward_inner(x, time, time, /*skip_ln=*/ true);
+    }
+
+    /// Apply conv-module residual: `x ← x + ConvModule(x)`.
+    /// `x` is `[time, d_model]` row-major.
     pub fn forward_residual(&self, x: &mut [f32], time: usize) {
+        self.forward_inner(x, time, time, /*skip_ln=*/ false);
+    }
+
+    /// Same as `forward_residual` but zeros frames `[valid_frames..time]`
+    /// before the depthwise convolution (matches NeMo's `pad_mask`
+    /// `masked_fill(...)` in `ConformerConvolution.forward`). Used when
+    /// the encoder input had trailing padding frames.
+    pub fn forward_residual_masked(&self, x: &mut [f32], time: usize, valid_frames: usize) {
+        self.forward_inner(x, time, valid_frames, /*skip_ln=*/ false);
+    }
+
+    fn forward_inner(&self, x: &mut [f32], time: usize, valid_frames: usize, skip_ln: bool) {
         let dm = self.d_model;
         let dff = 2 * dm;
         debug_assert_eq!(x.len(), time * dm);
@@ -65,9 +83,23 @@ impl ConvModule {
         // 1) LN + PW1 + GLU per frame → glu_out [time, dm]
         for t in 0..time {
             ln_buf.copy_from_slice(&x[t * dm..(t + 1) * dm]);
-            layer_norm(&mut ln_buf, &self.ln_gamma, &self.ln_beta, 1e-5);
+            if !skip_ln {
+                layer_norm(&mut ln_buf, &self.ln_gamma, &self.ln_beta, 1e-5);
+            }
             linear(&self.pw1_weight, &self.pw1_bias, &ln_buf, &mut pw1_out);
             glu_channels(&pw1_out, &mut glu_out[t * dm..(t + 1) * dm]);
+        }
+
+        // Apply padding mask BEFORE depthwise conv, matching NeMo's
+        // `ConformerConvolution.forward`. Frames at index `[valid_frames..time]`
+        // are zeroed so the depthwise kernel doesn't pick up garbage values
+        // at the trailing boundary.
+        if valid_frames < time {
+            for t in valid_frames..time {
+                for c in 0..dm {
+                    glu_out[t * dm + c] = 0.0;
+                }
+            }
         }
 
         // 2) Depthwise Conv1d along time for each channel. Symmetric

@@ -58,6 +58,10 @@ pub struct MultiHeadAttention {
     pub q_weight: Vec<f32>,
     pub q_bias: Vec<f32>,
     pub k_weight: Vec<f32>,
+    /// NeMo MHA has `use_bias=True` by default, so K has a bias too. Earlier
+    /// the loader silently dropped it which biased attention scores by a
+    /// constant per channel.
+    pub k_bias: Vec<f32>,
     pub v_weight: Vec<f32>,
     pub v_bias: Vec<f32>,
     pub out_weight: Vec<f32>,
@@ -85,15 +89,39 @@ impl MultiHeadAttention {
         time: usize,
         mode: AttentionMode,
     ) {
+        self.forward_inner(x, time, mode, /*skip_ln=*/ false);
+    }
+
+    /// Same as `forward_residual_with_mode` but treats `x` as already
+    /// LN'd input. Used by tests/layer_reference.rs to isolate attention
+    /// math from upstream LN behaviour.
+    pub fn forward_residual_no_ln(
+        &self,
+        x: &mut [f32],
+        time: usize,
+        mode: AttentionMode,
+    ) {
+        self.forward_inner(x, time, mode, /*skip_ln=*/ true);
+    }
+
+    fn forward_inner(
+        &self,
+        x: &mut [f32],
+        time: usize,
+        mode: AttentionMode,
+        skip_ln: bool,
+    ) {
         let dm = self.d_model;
         let h = self.n_heads;
         let d = self.head_dim;
         debug_assert_eq!(x.len(), time * dm);
         debug_assert_eq!(d * h, dm);
 
-        // 1) LN on a copy.
+        // 1) LN on a copy (or skip if caller already pre-normalized).
         let mut x_norm = x.to_vec();
-        layer_norm_rows(&mut x_norm, time, dm, &self.ln_gamma, &self.ln_beta, 1e-5);
+        if !skip_ln {
+            layer_norm_rows(&mut x_norm, time, dm, &self.ln_gamma, &self.ln_beta, 1e-5);
+        }
 
         // 2) Q, K, V projections.
         let mut q = vec![0.0_f32; time * dm];
@@ -106,7 +134,7 @@ impl MultiHeadAttention {
             mat_vec_add(&self.q_weight, src, qd, dm, dm);
 
             let kd = &mut k[t * dm..(t + 1) * dm];
-            // K typically has no bias in NeMo; use zero if not present.
+            kd.copy_from_slice(&self.k_bias);
             mat_vec_add(&self.k_weight, src, kd, dm, dm);
 
             let vd = &mut v[t * dm..(t + 1) * dm];
@@ -157,22 +185,29 @@ impl MultiHeadAttention {
 
                 // 2: BD[t_q, off] = Σ_c (Q[t_q,c] + v[c]) · P[off, c]
                 //    where off ∈ [0..2T-1] corresponds to relative
-                //    position (off - (T-1)). The rel-shift trick maps
-                //    (off, t_q) → t_k = t_q - (off - (T-1)) and we want
-                //    score[t_k] += BD[t_q, off]. Equivalently, for each
-                //    t_k we pick off = (T-1) + t_q - t_k.
-                let mut bd_row = vec![0.0_f32; pos_len];
-                for off in 0..pos_len {
-                    let mut s = 0.0_f32;
-                    for c in 0..d {
-                        s += (q_h(t_q, c) + v_bias_h(c)) * p_h(off, c);
+                //    position (off - (T-1)). For Longformer (`LocalGlobal`):
+                //    - Global QUERIES (t_q < global_tokens) use AC-only,
+                //      no BD — their attention goes through NeMo's
+                //      `_compute_global_key_attn` which doesn't include
+                //      the rel-pos bias.
+                //    - Non-global queries DO use BD on all keys (including
+                //      the global-key column), because NeMo's BD matrix is
+                //      added to the full local-attention scores.
+                let q_is_global = matches!(mode, AttentionMode::LocalGlobal { global_tokens, .. } if t_q < global_tokens);
+                if !q_is_global {
+                    let mut bd_row = vec![0.0_f32; pos_len];
+                    for off in 0..pos_len {
+                        let mut s = 0.0_f32;
+                        for c in 0..d {
+                            s += (q_h(t_q, c) + v_bias_h(c)) * p_h(off, c);
+                        }
+                        bd_row[off] = s;
                     }
-                    bd_row[off] = s;
-                }
-                for t_k in 0..time {
-                    let off = (time as isize - 1) + t_q as isize - t_k as isize;
-                    if (0..pos_len as isize).contains(&off) {
-                        score[t_k] += bd_row[off as usize];
+                    for t_k in 0..time {
+                        let off = (time as isize - 1) + t_q as isize - t_k as isize;
+                        if (0..pos_len as isize).contains(&off) {
+                            score[t_k] += bd_row[off as usize];
+                        }
                     }
                 }
 
@@ -189,7 +224,6 @@ impl MultiHeadAttention {
                     // attend only to keys within the window or to a
                     // global key. Mask the rest with -inf so softmax
                     // assigns them zero weight.
-                    let q_is_global = t_q < global_tokens;
                     if !q_is_global {
                         for t_k in 0..time {
                             let k_is_global = t_k < global_tokens;
@@ -286,6 +320,7 @@ mod tests {
             q_weight: vec![0.0; d_model * d_model],
             q_bias: vec![0.0; d_model],
             k_weight: vec![0.0; d_model * d_model],
+            k_bias: vec![0.0; d_model],
             v_weight: vec![0.0; d_model * d_model],
             v_bias: vec![0.0; d_model],
             out_weight: vec![0.0; d_model * d_model],
@@ -366,6 +401,7 @@ mod tests {
             q_weight: vec![0.0; d_model * d_model],
             q_bias: vec![0.0; d_model],
             k_weight: vec![0.0; d_model * d_model],
+            k_bias: vec![0.0; d_model],
             v_weight,
             v_bias: vec![0.0; d_model],
             out_weight,

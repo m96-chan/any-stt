@@ -239,15 +239,17 @@ All Whisper-architecture models in ggml/GGUF format.
 
 | Model | Params | Status | Notes |
 |-------|--------|--------|-------|
-| reazonspeech-nemo-v2 (`reazonspeech-backend`) | 619M | mel ✅ NeMo-compat, encoder forward ⚠️ drift | Japanese; FastConformer + Longformer attn + RNN-T |
+| reazonspeech-nemo-v2 (`reazonspeech-backend`) | 619M | end-to-end ✅ NeMo-equivalent text output | Japanese; FastConformer + Longformer attn + RNN-T |
 | parakeet-tdt-0.6b-v3 (`parakeet-backend`)     | 600M | skeleton ✅, weights not yet downloaded         | 25 European languages; FastConformer + rel-pos + TDT |
 
-The `mel` preprocessor is bit-equivalent to NeMo's
-`AudioToMelSpectrogramPreprocessor` (max_abs vs reference: **8.9e-5** on
-real Japanese audio). Stage-by-stage validation harness in
-`crates/fastconformer-core/tests/layer_reference.rs`. The encoder body
-runs end-to-end on real GGUFs but produces drifted output — fix is
-tracked under `#N9` (see `crates/fastconformer-core/README.md`).
+ReazonSpeech is verified pure-Rust against NeMo on
+`samples/japanese_test.wav`: greedy decode produces the same 27 token
+IDs as NeMo's RNN-T greedy/beam path, yielding
+`吾輩は猫である名前はまだないどこで生まれたかとんと見当がつかぬ。`.
+Mel preprocessor is bit-equivalent to torchaudio (max_abs 8.9e-5) and
+deviates from NeMo by at most 9.8e-2 (dither / boundary frame). Per-stage
+validation harness in `crates/reazonspeech-backend/tests/encoder_ref_decode.rs`,
+NeMo reference dumps via `scripts/nemo-truth-dump.py`.
 
 ### Qwen3-ASR family (planned)
 
