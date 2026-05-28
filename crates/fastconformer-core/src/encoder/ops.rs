@@ -296,31 +296,23 @@ pub fn linear_batch(
 
     // GEMM: out += X · W^T
     // For each output column (weight row), compute dot products with all input rows
-    if rows >= 4 {
-        // Parallel over output dimensions for large matrices
-        use rayon::prelude::*;
-        let out_chunks: Vec<(usize, Vec<f32>)> = (0..out_dim)
-            .into_par_iter()
-            .map(|j| {
-                let w_row = &weight[j * in_dim..(j + 1) * in_dim];
-                let mut col = vec![0.0_f32; rows];
-                for r in 0..rows {
-                    let x_row = &x[r * in_dim..(r + 1) * in_dim];
-                    col[r] = dot_f32(x_row, w_row);
-                }
-                (j, col)
-            })
-            .collect();
-        for (j, col) in out_chunks {
-            for r in 0..rows {
-                out[r * out_dim + j] += col[r];
-            }
-        }
-    } else {
-        for r in 0..rows {
+    // Row-parallel GEMM: each row independently computes dot products with all weight rows
+    use rayon::prelude::*;
+    let row_results: Vec<Vec<f32>> = (0..rows)
+        .into_par_iter()
+        .map(|r| {
             let x_row = &x[r * in_dim..(r + 1) * in_dim];
-            let out_row = &mut out[r * out_dim..(r + 1) * out_dim];
-            matvec_add(weight, x_row, out_row);
+            let mut result = vec![0.0_f32; out_dim];
+            for j in 0..out_dim {
+                let w_row = &weight[j * in_dim..(j + 1) * in_dim];
+                result[j] = dot_f32(x_row, w_row);
+            }
+            result
+        })
+        .collect();
+    for (r, row) in row_results.iter().enumerate() {
+        for j in 0..out_dim {
+            out[r * out_dim + j] += row[j];
         }
     }
 }
