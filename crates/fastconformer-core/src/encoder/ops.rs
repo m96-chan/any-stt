@@ -5,60 +5,28 @@
 
 use rayon::prelude::*;
 
-/// Dot product of two f32 slices using NEON SIMD on aarch64.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::aarch64::*;
-    let n = a.len();
-    debug_assert_eq!(n, b.len());
-
-    let chunks = n / 16;
-    let remainder = n % 16;
-
-    unsafe {
-        let mut sum0 = vdupq_n_f32(0.0);
-        let mut sum1 = vdupq_n_f32(0.0);
-        let mut sum2 = vdupq_n_f32(0.0);
-        let mut sum3 = vdupq_n_f32(0.0);
-
-        let ap = a.as_ptr();
-        let bp = b.as_ptr();
-
-        for i in 0..chunks {
-            let off = i * 16;
-            let a0 = vld1q_f32(ap.add(off));
-            let a1 = vld1q_f32(ap.add(off + 4));
-            let a2 = vld1q_f32(ap.add(off + 8));
-            let a3 = vld1q_f32(ap.add(off + 12));
-            let b0 = vld1q_f32(bp.add(off));
-            let b1 = vld1q_f32(bp.add(off + 4));
-            let b2 = vld1q_f32(bp.add(off + 8));
-            let b3 = vld1q_f32(bp.add(off + 12));
-            sum0 = vfmaq_f32(sum0, a0, b0);
-            sum1 = vfmaq_f32(sum1, a1, b1);
-            sum2 = vfmaq_f32(sum2, a2, b2);
-            sum3 = vfmaq_f32(sum3, a3, b3);
-        }
-
-        let combined = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
-        let mut s = vaddvq_f32(combined);
-
-        // Handle remainder
-        let tail_start = chunks * 16;
-        for i in 0..remainder {
-            s += a[tail_start + i] * b[tail_start + i];
-        }
-        s
-    }
-}
-
-/// Scalar fallback for non-aarch64.
-#[cfg(not(target_arch = "aarch64"))]
+/// Dot product of two f32 slices. Uses auto-vectorization friendly pattern.
 #[inline]
 fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(a, b)| a * b).sum()
+    // 4-way accumulator for better ILP and auto-vectorization
+    let mut s0 = 0.0_f32;
+    let mut s1 = 0.0_f32;
+    let mut s2 = 0.0_f32;
+    let mut s3 = 0.0_f32;
+    let chunks = a.len() / 4;
+    for i in 0..chunks {
+        let off = i * 4;
+        s0 += a[off] * b[off];
+        s1 += a[off + 1] * b[off + 1];
+        s2 += a[off + 2] * b[off + 2];
+        s3 += a[off + 3] * b[off + 3];
+    }
+    let mut s = s0 + s1 + s2 + s3;
+    for i in (chunks * 4)..a.len() {
+        s += a[i] * b[i];
+    }
+    s
 }
 
 /// `out += W · x` where W is `[rows, cols]` row-major and x has length
