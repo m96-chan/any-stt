@@ -10,7 +10,7 @@
 //!
 //! `fc1` expands `d_model → 4 * d_model`, `fc2` projects back to `d_model`.
 
-use crate::encoder::ops::{layer_norm, linear, swish_inplace};
+use crate::encoder::ops::{layer_norm, linear_batch, swish_inplace};
 
 /// Weights for one FF macaron half.
 pub struct FeedForward {
@@ -32,26 +32,31 @@ pub struct FeedForward {
 impl FeedForward {
     /// Apply one macaron half-residual step in place: `x ← x + 0.5 * FF(x)`.
     /// `x` is `[time, d_model]` row-major.
+    /// Batched: all time frames processed together through GEMM.
     pub fn forward_residual(&self, x: &mut [f32], time: usize) {
         debug_assert_eq!(x.len(), time * self.d_model);
         let dm = self.d_model;
         let dff = 4 * dm;
-        let mut buf = vec![0.0_f32; dm];
-        let mut hidden = vec![0.0_f32; dff];
+
+        // 1) Layer-normalize all frames into a buffer
+        let mut ln_buf = vec![0.0_f32; time * dm];
+        ln_buf.copy_from_slice(x);
         for t in 0..time {
-            // Copy frame, layer-normalize on a side buffer (we add 0.5 *
-            // FF(LN(x)) to the *original* x, not LN(x)).
-            buf.copy_from_slice(&x[t * dm..(t + 1) * dm]);
-            layer_norm(&mut buf, &self.ln_gamma, &self.ln_beta, 1e-5);
-            // fc1: [d_model] → [4*d_model]
-            linear(&self.fc1_weight, &self.fc1_bias, &buf, &mut hidden);
-            swish_inplace(&mut hidden);
-            // fc2: [4*d_model] → [d_model]
-            linear(&self.fc2_weight, &self.fc2_bias, &hidden, &mut buf);
-            // Residual with 0.5 macaron scale.
-            for c in 0..dm {
-                x[t * dm + c] += 0.5 * buf[c];
-            }
+            layer_norm(&mut ln_buf[t * dm..(t + 1) * dm], &self.ln_gamma, &self.ln_beta, 1e-5);
+        }
+
+        // 2) Batched fc1: [time, d_model] → [time, 4*d_model]
+        let mut hidden = vec![0.0_f32; time * dff];
+        linear_batch(&self.fc1_weight, &self.fc1_bias, &ln_buf, &mut hidden, time, dm, dff);
+        swish_inplace(&mut hidden);
+
+        // 3) Batched fc2: [time, 4*d_model] → [time, d_model]
+        let mut ff_out = vec![0.0_f32; time * dm];
+        linear_batch(&self.fc2_weight, &self.fc2_bias, &hidden, &mut ff_out, time, dff, dm);
+
+        // 4) Residual with 0.5 macaron scale
+        for i in 0..x.len() {
+            x[i] += 0.5 * ff_out[i];
         }
     }
 }

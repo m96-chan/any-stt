@@ -271,3 +271,56 @@ mod tests {
         }
     }
 }
+
+/// Batched linear: `out = X · W^T + bias` where X is `[rows, in_dim]`,
+/// W is `[out_dim, in_dim]`, bias is `[out_dim]`, out is `[rows, out_dim]`.
+/// Much faster than per-row matvec because of cache locality and SIMD throughput.
+pub fn linear_batch(
+    weight: &[f32],   // [out_dim, in_dim] row-major
+    bias: &[f32],     // [out_dim]
+    x: &[f32],        // [rows, in_dim] row-major
+    out: &mut [f32],   // [rows, out_dim] row-major
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) {
+    debug_assert_eq!(weight.len(), out_dim * in_dim);
+    debug_assert_eq!(bias.len(), out_dim);
+    debug_assert_eq!(x.len(), rows * in_dim);
+    debug_assert_eq!(out.len(), rows * out_dim);
+
+    // Initialize output with bias
+    for r in 0..rows {
+        out[r * out_dim..(r + 1) * out_dim].copy_from_slice(bias);
+    }
+
+    // GEMM: out += X · W^T
+    // For each output column (weight row), compute dot products with all input rows
+    if rows >= 4 {
+        // Parallel over output dimensions for large matrices
+        use rayon::prelude::*;
+        let out_chunks: Vec<(usize, Vec<f32>)> = (0..out_dim)
+            .into_par_iter()
+            .map(|j| {
+                let w_row = &weight[j * in_dim..(j + 1) * in_dim];
+                let mut col = vec![0.0_f32; rows];
+                for r in 0..rows {
+                    let x_row = &x[r * in_dim..(r + 1) * in_dim];
+                    col[r] = dot_f32(x_row, w_row);
+                }
+                (j, col)
+            })
+            .collect();
+        for (j, col) in out_chunks {
+            for r in 0..rows {
+                out[r * out_dim + j] += col[r];
+            }
+        }
+    } else {
+        for r in 0..rows {
+            let x_row = &x[r * in_dim..(r + 1) * in_dim];
+            let out_row = &mut out[r * out_dim..(r + 1) * out_dim];
+            matvec_add(weight, x_row, out_row);
+        }
+    }
+}

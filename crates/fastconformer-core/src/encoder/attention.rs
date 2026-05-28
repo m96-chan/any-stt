@@ -25,7 +25,7 @@
 //!   x ← x + out
 //! ```
 
-use crate::encoder::ops::{layer_norm_rows, softmax_inplace};
+use crate::encoder::ops::{layer_norm_rows, linear_batch, softmax_inplace};
 
 /// Which attention pattern to use.
 #[derive(Debug, Clone, Copy)]
@@ -123,35 +123,20 @@ impl MultiHeadAttention {
             layer_norm_rows(&mut x_norm, time, dm, &self.ln_gamma, &self.ln_beta, 1e-5);
         }
 
-        // 2) Q, K, V projections.
+        // 2) Q, K, V projections — batched GEMM.
         let mut q = vec![0.0_f32; time * dm];
         let mut k = vec![0.0_f32; time * dm];
         let mut v = vec![0.0_f32; time * dm];
-        for t in 0..time {
-            let src = &x_norm[t * dm..(t + 1) * dm];
-            let qd = &mut q[t * dm..(t + 1) * dm];
-            qd.copy_from_slice(&self.q_bias);
-            mat_vec_add(&self.q_weight, src, qd, dm, dm);
+        linear_batch(&self.q_weight, &self.q_bias, &x_norm, &mut q, time, dm, dm);
+        linear_batch(&self.k_weight, &self.k_bias, &x_norm, &mut k, time, dm, dm);
+        linear_batch(&self.v_weight, &self.v_bias, &x_norm, &mut v, time, dm, dm);
 
-            let kd = &mut k[t * dm..(t + 1) * dm];
-            kd.copy_from_slice(&self.k_bias);
-            mat_vec_add(&self.k_weight, src, kd, dm, dm);
-
-            let vd = &mut v[t * dm..(t + 1) * dm];
-            vd.copy_from_slice(&self.v_bias);
-            mat_vec_add(&self.v_weight, src, vd, dm, dm);
-        }
-
-        // 3) Positional embeddings: build sinusoidal table of length 2T-1
-        //    for offsets [-(T-1) .. T-1], project through W_pos.
+        // 3) Positional embeddings — batched GEMM.
         let pos_len = 2 * time - 1;
         let pe_table = sinusoidal_pos_emb(pos_len, dm);
+        let pe_bias = vec![0.0_f32; dm];
         let mut pe_proj = vec![0.0_f32; pos_len * dm];
-        for i in 0..pos_len {
-            let src = &pe_table[i * dm..(i + 1) * dm];
-            let dst = &mut pe_proj[i * dm..(i + 1) * dm];
-            mat_vec_add(&self.pos_weight, src, dst, dm, dm);
-        }
+        linear_batch(&self.pos_weight, &pe_bias, &pe_table, &mut pe_proj, pos_len, dm, dm);
 
         // 4) Per-head computation.
         let inv_sqrt_d = 1.0 / (d as f32).sqrt();
@@ -248,14 +233,9 @@ impl MultiHeadAttention {
             }
         }
 
-        // 5) Output projection.
+        // 5) Output projection — batched GEMM.
         let mut proj = vec![0.0_f32; time * dm];
-        for t in 0..time {
-            let src = &output[t * dm..(t + 1) * dm];
-            let dst = &mut proj[t * dm..(t + 1) * dm];
-            dst.copy_from_slice(&self.out_bias);
-            mat_vec_add(&self.out_weight, src, dst, dm, dm);
-        }
+        linear_batch(&self.out_weight, &self.out_bias, &output, &mut proj, time, dm, dm);
 
         // 6) Residual.
         for i in 0..time * dm {

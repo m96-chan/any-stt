@@ -28,8 +28,8 @@ pub mod ops;
 pub mod subsample;
 
 pub use ops::{
-    batch_norm_1d_inference, glu_channels, layer_norm, layer_norm_rows, linear, matvec_add,
-    softmax_inplace, swish_inplace,
+    batch_norm_1d_inference, glu_channels, layer_norm, layer_norm_rows, linear, linear_batch,
+    matvec_add, softmax_inplace, swish_inplace,
 };
 
 use crate::config::Config;
