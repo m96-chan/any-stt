@@ -360,12 +360,22 @@ def dtype_to_gguf(name: str) -> "gguf.GGMLQuantizationType":
     }[name]
 
 
-def cast_tensor(t: torch.Tensor, dtype: str) -> np.ndarray:
+def cast_tensor(t: torch.Tensor, dtype: str) -> tuple[np.ndarray, "gguf.GGMLQuantizationType | None"]:
+    """テンソルを指定 dtype に変換。Q8_0 の場合は (f32_array, Q8_0) を返す。"""
     arr = t.detach().cpu().contiguous()
     if dtype == "f32":
-        return arr.to(torch.float32).numpy()
+        return arr.to(torch.float32).numpy(), None
     if dtype == "f16":
-        return arr.to(torch.float16).numpy()
+        return arr.to(torch.float16).numpy(), None
+    if dtype in ("q8_0", "q4_0"):
+        qtype = gguf.GGMLQuantizationType.Q8_0 if dtype == "q8_0" else gguf.GGMLQuantizationType.Q4_0
+        shape = list(arr.shape)
+        nelems = int(np.prod(shape))
+        if len(shape) >= 2 and nelems >= 256 and shape[-1] % 32 == 0:
+            f32 = arr.to(torch.float32).numpy().flatten()
+            qdata = gguf.quantize(f32, qtype)
+            return qdata, qtype
+        return arr.to(torch.float16).numpy(), None
     raise ValueError(f"unsupported dtype: {dtype}")
 
 
@@ -424,8 +434,14 @@ def write_gguf(
         if new_name is None:
             skipped.append(orig_name)
             continue
-        arr = cast_tensor(tensor, dtype)
-        writer.add_tensor(new_name, arr)
+        arr, raw_dtype = cast_tensor(tensor, dtype)
+        if raw_dtype is not None:
+            orig_shape = list(tensor.shape)
+            byte_shape = gguf.quants.quant_shape_to_byte_shape(orig_shape, raw_dtype)
+            arr = arr.reshape(byte_shape)
+            writer.add_tensor(new_name, arr, raw_shape=byte_shape, raw_dtype=raw_dtype)
+        else:
+            writer.add_tensor(new_name, arr)
         renamed_count += 1
 
     if skipped:
@@ -453,9 +469,9 @@ def main() -> int:
                     help="output .gguf path (required unless --self-test)")
     ap.add_argument(
         "--dtype",
-        choices=("f32", "f16"),
+        choices=("f32", "f16", "q8_0", "q4_0"),
         default="f16",
-        help="quantization for non-quant tensors (default: f16)",
+        help="tensor dtype: f32, f16, or q8_0 (default: f16)",
     )
     ap.add_argument(
         "--source-label",
