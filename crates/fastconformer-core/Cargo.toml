@@ -12,3 +12,4 @@ gguf-loader = { path = "../gguf-loader" }
 realfft = "3"
 thiserror = "2"
 rayon = "1"
+half = "2"

@@ -104,6 +104,7 @@ name = "fastconformer-core"
 version = "0.1.0"
 dependencies = [
  "gguf-loader",
+ "half",
  "rayon",
  "realfft",
  "thiserror",
@@ -218,6 +219,7 @@ dependencies = [
  "any-stt",
  "fastconformer-core",
  "gguf-loader",
+ "half",
  "thiserror",
 ]
 
@@ -300,6 +302,7 @@ dependencies = [
  "any-stt",
  "fastconformer-core",
  "gguf-loader",
+ "half",
  "thiserror",
 ]
 

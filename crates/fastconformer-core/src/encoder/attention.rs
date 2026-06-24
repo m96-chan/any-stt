@@ -25,7 +25,8 @@
 //!   x ← x + out
 //! ```
 
-use crate::encoder::ops::{layer_norm_rows, linear_batch, softmax_inplace};
+use crate::encoder::ops::{layer_norm_rows, linear_batch_f16, softmax_inplace};
+use half::f16;
 
 /// Which attention pattern to use.
 #[derive(Debug, Clone, Copy)]
@@ -55,20 +56,20 @@ pub struct MultiHeadAttention {
     pub ln_beta: Vec<f32>,
 
     // Q / K / V / out projections: each [d_model, d_model]
-    pub q_weight: Vec<f32>,
+    pub q_weight: Vec<f16>,
     pub q_bias: Vec<f32>,
-    pub k_weight: Vec<f32>,
+    pub k_weight: Vec<f16>,
     /// NeMo MHA has `use_bias=True` by default, so K has a bias too. Earlier
     /// the loader silently dropped it which biased attention scores by a
     /// constant per channel.
     pub k_bias: Vec<f32>,
-    pub v_weight: Vec<f32>,
+    pub v_weight: Vec<f16>,
     pub v_bias: Vec<f32>,
-    pub out_weight: Vec<f32>,
+    pub out_weight: Vec<f16>,
     pub out_bias: Vec<f32>,
 
     // Positional projection: [d_model, d_model]
-    pub pos_weight: Vec<f32>,
+    pub pos_weight: Vec<f16>,
 
     // Per-head learned position biases: each [n_heads, head_dim]
     pub pos_bias_u: Vec<f32>,
@@ -127,16 +128,16 @@ impl MultiHeadAttention {
         let mut q = vec![0.0_f32; time * dm];
         let mut k = vec![0.0_f32; time * dm];
         let mut v = vec![0.0_f32; time * dm];
-        linear_batch(&self.q_weight, &self.q_bias, &x_norm, &mut q, time, dm, dm);
-        linear_batch(&self.k_weight, &self.k_bias, &x_norm, &mut k, time, dm, dm);
-        linear_batch(&self.v_weight, &self.v_bias, &x_norm, &mut v, time, dm, dm);
+        linear_batch_f16(&self.q_weight, &self.q_bias, &x_norm, &mut q, time, dm, dm);
+        linear_batch_f16(&self.k_weight, &self.k_bias, &x_norm, &mut k, time, dm, dm);
+        linear_batch_f16(&self.v_weight, &self.v_bias, &x_norm, &mut v, time, dm, dm);
 
         // 3) Positional embeddings — batched GEMM.
         let pos_len = 2 * time - 1;
         let pe_table = sinusoidal_pos_emb(pos_len, dm);
         let pe_bias = vec![0.0_f32; dm];
         let mut pe_proj = vec![0.0_f32; pos_len * dm];
-        linear_batch(&self.pos_weight, &pe_bias, &pe_table, &mut pe_proj, pos_len, dm, dm);
+        linear_batch_f16(&self.pos_weight, &pe_bias, &pe_table, &mut pe_proj, pos_len, dm, dm);
 
         // 4) Per-head computation.
         let inv_sqrt_d = 1.0 / (d as f32).sqrt();
@@ -235,7 +236,7 @@ impl MultiHeadAttention {
 
         // 5) Output projection — batched GEMM.
         let mut proj = vec![0.0_f32; time * dm];
-        linear_batch(&self.out_weight, &self.out_bias, &output, &mut proj, time, dm, dm);
+        linear_batch_f16(&self.out_weight, &self.out_bias, &output, &mut proj, time, dm, dm);
 
         // 6) Residual.
         for i in 0..time * dm {
@@ -297,15 +298,15 @@ mod tests {
             head_dim,
             ln_gamma: vec![1.0; d_model],
             ln_beta: vec![0.0; d_model],
-            q_weight: vec![0.0; d_model * d_model],
+            q_weight: vec![f16::from_f32(0.0); d_model * d_model],
             q_bias: vec![0.0; d_model],
-            k_weight: vec![0.0; d_model * d_model],
+            k_weight: vec![f16::from_f32(0.0); d_model * d_model],
             k_bias: vec![0.0; d_model],
-            v_weight: vec![0.0; d_model * d_model],
+            v_weight: vec![f16::from_f32(0.0); d_model * d_model],
             v_bias: vec![0.0; d_model],
-            out_weight: vec![0.0; d_model * d_model],
+            out_weight: vec![f16::from_f32(0.0); d_model * d_model],
             out_bias: vec![0.0; d_model],
-            pos_weight: vec![0.0; d_model * d_model],
+            pos_weight: vec![f16::from_f32(0.0); d_model * d_model],
             pos_bias_u: vec![0.0; n_heads * head_dim],
             pos_bias_v: vec![0.0; n_heads * head_dim],
         }
@@ -364,13 +365,13 @@ mod tests {
     fn permissive_mha(d_model: usize, n_heads: usize) -> MultiHeadAttention {
         let head_dim = d_model / n_heads;
         // Identity-ish: V projects input to itself (W_v = I, b_v = 0).
-        let mut v_weight = vec![0.0_f32; d_model * d_model];
+        let mut v_weight = vec![f16::from_f32(0.0); d_model * d_model];
         for i in 0..d_model {
-            v_weight[i * d_model + i] = 1.0;
+            v_weight[i * d_model + i] = f16::from_f32(1.0);
         }
-        let mut out_weight = vec![0.0_f32; d_model * d_model];
+        let mut out_weight = vec![f16::from_f32(0.0); d_model * d_model];
         for i in 0..d_model {
-            out_weight[i * d_model + i] = 1.0;
+            out_weight[i * d_model + i] = f16::from_f32(1.0);
         }
         MultiHeadAttention {
             d_model,
@@ -378,15 +379,15 @@ mod tests {
             head_dim,
             ln_gamma: vec![1.0; d_model],
             ln_beta: vec![0.0; d_model],
-            q_weight: vec![0.0; d_model * d_model],
+            q_weight: vec![f16::from_f32(0.0); d_model * d_model],
             q_bias: vec![0.0; d_model],
-            k_weight: vec![0.0; d_model * d_model],
+            k_weight: vec![f16::from_f32(0.0); d_model * d_model],
             k_bias: vec![0.0; d_model],
             v_weight,
             v_bias: vec![0.0; d_model],
             out_weight,
             out_bias: vec![0.0; d_model],
-            pos_weight: vec![0.0; d_model * d_model],
+            pos_weight: vec![f16::from_f32(0.0); d_model * d_model],
             pos_bias_u: vec![0.0; n_heads * head_dim],
             pos_bias_v: vec![0.0; n_heads * head_dim],
         }

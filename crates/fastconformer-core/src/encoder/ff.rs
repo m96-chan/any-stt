@@ -10,7 +10,8 @@
 //!
 //! `fc1` expands `d_model → 4 * d_model`, `fc2` projects back to `d_model`.
 
-use crate::encoder::ops::{layer_norm, linear_batch, swish_inplace};
+use crate::encoder::ops::{layer_norm, linear_batch_f16, swish_inplace};
+use half::f16;
 
 /// Weights for one FF macaron half.
 pub struct FeedForward {
@@ -19,11 +20,11 @@ pub struct FeedForward {
     /// `[d_model]`
     pub ln_beta: Vec<f32>,
     /// `[4 * d_model, d_model]`
-    pub fc1_weight: Vec<f32>,
+    pub fc1_weight: Vec<f16>,
     /// `[4 * d_model]`
     pub fc1_bias: Vec<f32>,
     /// `[d_model, 4 * d_model]`
-    pub fc2_weight: Vec<f32>,
+    pub fc2_weight: Vec<f16>,
     /// `[d_model]`
     pub fc2_bias: Vec<f32>,
     pub d_model: usize,
@@ -47,12 +48,12 @@ impl FeedForward {
 
         // 2) Batched fc1: [time, d_model] → [time, 4*d_model]
         let mut hidden = vec![0.0_f32; time * dff];
-        linear_batch(&self.fc1_weight, &self.fc1_bias, &ln_buf, &mut hidden, time, dm, dff);
+        linear_batch_f16(&self.fc1_weight, &self.fc1_bias, &ln_buf, &mut hidden, time, dm, dff);
         swish_inplace(&mut hidden);
 
         // 3) Batched fc2: [time, 4*d_model] → [time, d_model]
         let mut ff_out = vec![0.0_f32; time * dm];
-        linear_batch(&self.fc2_weight, &self.fc2_bias, &hidden, &mut ff_out, time, dff, dm);
+        linear_batch_f16(&self.fc2_weight, &self.fc2_bias, &hidden, &mut ff_out, time, dff, dm);
 
         // 4) Residual with 0.5 macaron scale
         for i in 0..x.len() {
@@ -71,9 +72,9 @@ mod tests {
         let ln_gamma = vec![1.0; d_model];
         let ln_beta = vec![0.0; d_model];
         // fc1 zero → output zero → swish(0) = 0 → fc2 zero → 0
-        let fc1_weight = vec![0.0; dff * d_model];
+        let fc1_weight = vec![f16::from_f32(0.0); dff * d_model];
         let fc1_bias = vec![0.0; dff];
-        let fc2_weight = vec![0.0; d_model * dff];
+        let fc2_weight = vec![f16::from_f32(0.0); d_model * dff];
         let fc2_bias = vec![0.0; d_model];
         FeedForward {
             ln_gamma,

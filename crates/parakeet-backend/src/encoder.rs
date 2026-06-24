@@ -14,6 +14,14 @@ use fastconformer_core::encoder::{
 pub use fastconformer_core::encoder::EncoderOutput;
 use fastconformer_core::Config;
 use gguf_loader::GgufFile;
+use half::f16;
+
+/// Dequantize a tensor to f16-backed storage (f32 dequant → f16 cast). Used
+/// for the large 2D weight matrices that go through `linear_f16` /
+/// `linear_batch_f16`, halving their resident RAM footprint.
+fn deq_f16(gguf: &GgufFile, name: &str) -> Result<Vec<f16>, String> {
+    Ok(gguf.dequantize_f32(name)?.into_iter().map(f16::from_f32).collect())
+}
 
 pub fn load(gguf: &GgufFile, cfg: Config) -> Result<FastConformerEncoder, String> {
     let dm = cfg.d_model as usize;
@@ -105,9 +113,9 @@ fn load_block(
     let ff1 = FeedForward {
         ln_gamma: gguf.dequantize_f32(&format!("{pfx}.ff1.ln.weight"))?,
         ln_beta: gguf.dequantize_f32(&format!("{pfx}.ff1.ln.bias"))?,
-        fc1_weight: gguf.dequantize_f32(&format!("{pfx}.ff1.fc1.weight"))?,
+        fc1_weight: deq_f16(gguf, &format!("{pfx}.ff1.fc1.weight"))?,
         fc1_bias: gguf.dequantize_f32(&format!("{pfx}.ff1.fc1.bias"))?,
-        fc2_weight: gguf.dequantize_f32(&format!("{pfx}.ff1.fc2.weight"))?,
+        fc2_weight: deq_f16(gguf, &format!("{pfx}.ff1.fc2.weight"))?,
         fc2_bias: gguf.dequantize_f32(&format!("{pfx}.ff1.fc2.bias"))?,
         d_model: dm,
     };
@@ -117,23 +125,23 @@ fn load_block(
         head_dim,
         ln_gamma: gguf.dequantize_f32(&format!("{pfx}.attn.ln.weight"))?,
         ln_beta: gguf.dequantize_f32(&format!("{pfx}.attn.ln.bias"))?,
-        q_weight: gguf.dequantize_f32(&format!("{pfx}.attn.q.weight"))?,
+        q_weight: deq_f16(gguf, &format!("{pfx}.attn.q.weight"))?,
         q_bias: gguf
             .dequantize_f32(&format!("{pfx}.attn.q.bias"))
             .unwrap_or_else(|_| vec![0.0; dm]),
-        k_weight: gguf.dequantize_f32(&format!("{pfx}.attn.k.weight"))?,
+        k_weight: deq_f16(gguf, &format!("{pfx}.attn.k.weight"))?,
         k_bias: gguf
             .dequantize_f32(&format!("{pfx}.attn.k.bias"))
             .unwrap_or_else(|_| vec![0.0; dm]),
-        v_weight: gguf.dequantize_f32(&format!("{pfx}.attn.v.weight"))?,
+        v_weight: deq_f16(gguf, &format!("{pfx}.attn.v.weight"))?,
         v_bias: gguf
             .dequantize_f32(&format!("{pfx}.attn.v.bias"))
             .unwrap_or_else(|_| vec![0.0; dm]),
-        out_weight: gguf.dequantize_f32(&format!("{pfx}.attn.out.weight"))?,
+        out_weight: deq_f16(gguf, &format!("{pfx}.attn.out.weight"))?,
         out_bias: gguf
             .dequantize_f32(&format!("{pfx}.attn.out.bias"))
             .unwrap_or_else(|_| vec![0.0; dm]),
-        pos_weight: gguf.dequantize_f32(&format!("{pfx}.attn.pos.weight"))?,
+        pos_weight: deq_f16(gguf, &format!("{pfx}.attn.pos.weight"))?,
         pos_bias_u: gguf.dequantize_f32(&format!("{pfx}.attn.pos_bias_u"))?,
         pos_bias_v: gguf.dequantize_f32(&format!("{pfx}.attn.pos_bias_v"))?,
     };
@@ -142,7 +150,7 @@ fn load_block(
         conv_kernel_size: conv_kernel,
         ln_gamma: gguf.dequantize_f32(&format!("{pfx}.conv.ln.weight"))?,
         ln_beta: gguf.dequantize_f32(&format!("{pfx}.conv.ln.bias"))?,
-        pw1_weight: gguf.dequantize_f32(&format!("{pfx}.conv.pw1.weight"))?,
+        pw1_weight: deq_f16(gguf, &format!("{pfx}.conv.pw1.weight"))?,
         pw1_bias: gguf
             .dequantize_f32(&format!("{pfx}.conv.pw1.bias"))
             .unwrap_or_else(|_| vec![0.0; 2 * dm]),
@@ -154,7 +162,7 @@ fn load_block(
         bn_beta: gguf.dequantize_f32(&format!("{pfx}.conv.bn.bias"))?,
         bn_running_mean: gguf.dequantize_f32(&format!("{pfx}.conv.bn.running_mean"))?,
         bn_running_var: gguf.dequantize_f32(&format!("{pfx}.conv.bn.running_var"))?,
-        pw2_weight: gguf.dequantize_f32(&format!("{pfx}.conv.pw2.weight"))?,
+        pw2_weight: deq_f16(gguf, &format!("{pfx}.conv.pw2.weight"))?,
         pw2_bias: gguf
             .dequantize_f32(&format!("{pfx}.conv.pw2.bias"))
             .unwrap_or_else(|_| vec![0.0; dm]),
@@ -162,9 +170,9 @@ fn load_block(
     let ff2 = FeedForward {
         ln_gamma: gguf.dequantize_f32(&format!("{pfx}.ff2.ln.weight"))?,
         ln_beta: gguf.dequantize_f32(&format!("{pfx}.ff2.ln.bias"))?,
-        fc1_weight: gguf.dequantize_f32(&format!("{pfx}.ff2.fc1.weight"))?,
+        fc1_weight: deq_f16(gguf, &format!("{pfx}.ff2.fc1.weight"))?,
         fc1_bias: gguf.dequantize_f32(&format!("{pfx}.ff2.fc1.bias"))?,
-        fc2_weight: gguf.dequantize_f32(&format!("{pfx}.ff2.fc2.weight"))?,
+        fc2_weight: deq_f16(gguf, &format!("{pfx}.ff2.fc2.weight"))?,
         fc2_bias: gguf.dequantize_f32(&format!("{pfx}.ff2.fc2.bias"))?,
         d_model: dm,
     };

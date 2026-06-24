@@ -16,8 +16,9 @@
 //! every output channel only mixes its own input channel along time.
 
 use crate::encoder::ops::{
-    batch_norm_1d_inference, glu_channels, layer_norm, linear, swish_inplace,
+    batch_norm_1d_inference, glu_channels, layer_norm, linear_f16, swish_inplace,
 };
+use half::f16;
 
 pub struct ConvModule {
     pub d_model: usize,
@@ -28,7 +29,7 @@ pub struct ConvModule {
     pub ln_beta: Vec<f32>,
 
     // Pointwise 1: [2*d_model, d_model]
-    pub pw1_weight: Vec<f32>,
+    pub pw1_weight: Vec<f16>,
     pub pw1_bias: Vec<f32>,
 
     // Depthwise: per-channel 1D kernel of length `conv_kernel_size`.
@@ -43,7 +44,7 @@ pub struct ConvModule {
     pub bn_running_var: Vec<f32>,
 
     // Pointwise 2: [d_model, d_model]
-    pub pw2_weight: Vec<f32>,
+    pub pw2_weight: Vec<f16>,
     pub pw2_bias: Vec<f32>,
 }
 
@@ -86,7 +87,7 @@ impl ConvModule {
             if !skip_ln {
                 layer_norm(&mut ln_buf, &self.ln_gamma, &self.ln_beta, 1e-5);
             }
-            linear(&self.pw1_weight, &self.pw1_bias, &ln_buf, &mut pw1_out);
+            linear_f16(&self.pw1_weight, &self.pw1_bias, &ln_buf, &mut pw1_out);
             glu_channels(&pw1_out, &mut glu_out[t * dm..(t + 1) * dm]);
         }
 
@@ -130,7 +131,7 @@ impl ConvModule {
         // 4) Pointwise 2 per frame.
         for t in 0..time {
             let src = &after_dw[t * dm..(t + 1) * dm];
-            linear(
+            linear_f16(
                 &self.pw2_weight,
                 &self.pw2_bias,
                 src,
@@ -189,7 +190,7 @@ mod tests {
             conv_kernel_size: kernel,
             ln_gamma: vec![1.0; d_model],
             ln_beta: vec![0.0; d_model],
-            pw1_weight: vec![0.0; 2 * d_model * d_model],
+            pw1_weight: vec![f16::from_f32(0.0); 2 * d_model * d_model],
             pw1_bias: vec![0.0; 2 * d_model],
             dw_weight: vec![0.0; d_model * kernel],
             dw_bias: vec![0.0; d_model],
@@ -197,7 +198,7 @@ mod tests {
             bn_beta: vec![0.0; d_model],
             bn_running_mean: vec![0.0; d_model],
             bn_running_var: vec![1.0; d_model],
-            pw2_weight: vec![0.0; d_model * d_model],
+            pw2_weight: vec![f16::from_f32(0.0); d_model * d_model],
             pw2_bias: vec![0.0; d_model],
         }
     }

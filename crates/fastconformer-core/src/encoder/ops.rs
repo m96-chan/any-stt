@@ -3,6 +3,7 @@
 //! NEON SIMD on aarch64, rayon parallelism for large matmul.
 //! Falls back to scalar on other architectures.
 
+use half::f16;
 use rayon::prelude::*;
 
 /// Dot product of two f32 slices. Uses auto-vectorization friendly pattern.
@@ -27,6 +28,57 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         s += a[i] * b[i];
     }
     s
+}
+
+/// Dot product of an f16 weight slice with an f32 input slice. Each weight
+/// element is converted to f32 before multiply, so accumulation stays f32.
+/// Same 4-way accumulator structure as [`dot_f32`].
+#[inline]
+fn dot_f16_f32(w: &[f16], x: &[f32]) -> f32 {
+    debug_assert_eq!(w.len(), x.len());
+    let mut s0 = 0.0_f32;
+    let mut s1 = 0.0_f32;
+    let mut s2 = 0.0_f32;
+    let mut s3 = 0.0_f32;
+    let chunks = w.len() / 4;
+    for i in 0..chunks {
+        let off = i * 4;
+        s0 += w[off].to_f32() * x[off];
+        s1 += w[off + 1].to_f32() * x[off + 1];
+        s2 += w[off + 2].to_f32() * x[off + 2];
+        s3 += w[off + 3].to_f32() * x[off + 3];
+    }
+    let mut s = s0 + s1 + s2 + s3;
+    for i in (chunks * 4)..w.len() {
+        s += w[i].to_f32() * x[i];
+    }
+    s
+}
+
+/// f16-weight variant of [`matvec_add`]. `w` is `[rows, cols]` f16 row-major,
+/// `x`/`out` are f32. Conversion to f32 happens inside the dot product.
+pub fn matvec_add_f16(w: &[f16], x: &[f32], out: &mut [f32]) {
+    let rows = out.len();
+    let cols = x.len();
+    debug_assert_eq!(w.len(), rows * cols, "matvec_add_f16: shape mismatch");
+
+    if rows > 128 {
+        let results: Vec<f32> = (0..rows)
+            .into_par_iter()
+            .map(|r| {
+                let row = &w[r * cols..(r + 1) * cols];
+                dot_f16_f32(row, x)
+            })
+            .collect();
+        for (o, r) in out.iter_mut().zip(results.iter()) {
+            *o += r;
+        }
+    } else {
+        for r in 0..rows {
+            let row = &w[r * cols..(r + 1) * cols];
+            out[r] += dot_f16_f32(row, x);
+        }
+    }
 }
 
 /// `out += W · x` where W is `[rows, cols]` row-major and x has length
@@ -63,6 +115,12 @@ pub fn matvec_add(w: &[f32], x: &[f32], out: &mut [f32]) {
 pub fn linear(weight: &[f32], bias: &[f32], x: &[f32], out: &mut [f32]) {
     out.copy_from_slice(bias);
     matvec_add(weight, x, out);
+}
+
+/// f16-weight variant of [`linear`]: `y = W · x + b` with W in f16.
+pub fn linear_f16(weight: &[f16], bias: &[f32], x: &[f32], out: &mut [f32]) {
+    out.copy_from_slice(bias);
+    matvec_add_f16(weight, x, out);
 }
 
 /// LayerNorm across the last dimension.
@@ -274,6 +332,49 @@ pub fn linear_batch(
             for j in 0..out_dim {
                 let w_row = &weight[j * in_dim..(j + 1) * in_dim];
                 result[j] = dot_f32(x_row, w_row);
+            }
+            result
+        })
+        .collect();
+    for (r, row) in row_results.iter().enumerate() {
+        for j in 0..out_dim {
+            out[r * out_dim + j] += row[j];
+        }
+    }
+}
+
+/// f16-weight variant of [`linear_batch`]: `out = X · W^T + bias` where W is
+/// stored as f16 (`[out_dim, in_dim]` row-major). X / bias / out stay f32.
+/// Each weight element is converted to f32 inside the dot product.
+pub fn linear_batch_f16(
+    weight: &[f16],   // [out_dim, in_dim] row-major
+    bias: &[f32],     // [out_dim]
+    x: &[f32],        // [rows, in_dim] row-major
+    out: &mut [f32],   // [rows, out_dim] row-major
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) {
+    debug_assert_eq!(weight.len(), out_dim * in_dim);
+    debug_assert_eq!(bias.len(), out_dim);
+    debug_assert_eq!(x.len(), rows * in_dim);
+    debug_assert_eq!(out.len(), rows * out_dim);
+
+    // Initialize output with bias
+    for r in 0..rows {
+        out[r * out_dim..(r + 1) * out_dim].copy_from_slice(bias);
+    }
+
+    // Row-parallel GEMM: each row independently computes dot products with all weight rows.
+    use rayon::prelude::*;
+    let row_results: Vec<Vec<f32>> = (0..rows)
+        .into_par_iter()
+        .map(|r| {
+            let x_row = &x[r * in_dim..(r + 1) * in_dim];
+            let mut result = vec![0.0_f32; out_dim];
+            for j in 0..out_dim {
+                let w_row = &weight[j * in_dim..(j + 1) * in_dim];
+                result[j] = dot_f16_f32(w_row, x_row);
             }
             result
         })
